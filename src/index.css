@@ -1,0 +1,6 @@
+@import "tailwindcss";
+
+@layer components {
+  .field { @apply mt-2 w-full p-3 rounded-xl border border-slate-300 bg-white outline-none focus:ring-2 focus:ring-emerald-400; }
+  .label { @apply block text-xs font-black uppercase tracking-wide text-slate-600; }
+}
