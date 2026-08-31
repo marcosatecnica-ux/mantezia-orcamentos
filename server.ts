@@ -11,6 +11,11 @@ const PORT = Number(process.env.PORT || 3100);
 app.use(express.json({ limit: '10mb' }));
 
 const databaseUrl = process.env.DATABASE_URL?.trim();
+const operacionalUrl =
+  process.env.OPERACIONAL_MANTEZIA_URL?.replace(/\/$/, '');
+
+const orcamentosIntegrationKey =
+  process.env.ORCAMENTOS_INTEGRATION_KEY?.trim();
 
 const pool = databaseUrl
   ? new Pool({
@@ -786,7 +791,9 @@ app.put('/api/orcamentos/:id/status', async (req, res) => {
     String(req.body?.reason || '').trim() || null;
 
   const permitidos = [
-    'pending_approval'
+    'pending_approval',
+    'approved',
+    'rejected'
   ];
 
   if (!permitidos.includes(novoStatus)) {
@@ -802,7 +809,7 @@ app.put('/api/orcamentos/:id/status', async (req, res) => {
 
     const atual = await client.query(
       `
-      select id, status
+      select id, status, code, source_order_id, source_order_code
       from orcamentos.quotes
       where id = $1
         and organization_id = $2
@@ -822,22 +829,119 @@ app.put('/api/orcamentos/:id/status', async (req, res) => {
     const statusAnterior =
       atual.rows[0].status;
 
-    if (
-      novoStatus === 'pending_approval' &&
-      statusAnterior !== 'draft'
-    ) {
+    const transicaoValida =
+      (
+        novoStatus === 'pending_approval' &&
+        statusAnterior === 'draft'
+      ) ||
+      (
+        ['approved','rejected'].includes(novoStatus) &&
+        statusAnterior === 'pending_approval'
+      );
+
+    if (!transicaoValida) {
       await client.query('rollback');
 
       return res.status(409).json({
         error:
-          'Somente orçamentos em elaboração podem ser enviados para aprovação.'
+          'Transição de status não permitida para este orçamento.'
       });
+    }
+
+    if (novoStatus === 'approved') {
+      if (!operacionalUrl || !orcamentosIntegrationKey) {
+        await client.query('rollback');
+
+        return res.status(503).json({
+          error:
+            'Integração com o Mantezia Operacional não configurada.'
+        });
+      }
+
+      const sourceOrderId =
+        String(atual.rows[0].source_order_id || '').trim();
+
+      const sourceOrderCode =
+        String(atual.rows[0].source_order_code || '').trim();
+
+      const orcamentoCode =
+        String(atual.rows[0].code || '').trim();
+
+      if (!sourceOrderId) {
+        await client.query('rollback');
+
+        return res.status(409).json({
+          error:
+            'Este orçamento não possui uma OS de origem vinculada.'
+        });
+      }
+
+      try {
+        const responseOperacional = await fetch(
+          `${operacionalUrl}/internal/orcamentos/liberar-execucao`,
+          {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              'x-mantezia-integration-key':
+                orcamentosIntegrationKey
+            },
+            body: JSON.stringify({
+              sourceOrderId,
+              sourceOrderCode,
+              orcamentoId: quoteId,
+              orcamentoCode
+            }),
+            signal: AbortSignal.timeout(10_000)
+          }
+        );
+
+        const retornoOperacional =
+          await responseOperacional
+            .json()
+            .catch(() => null) as any;
+
+        if (!responseOperacional.ok) {
+          await client.query('rollback');
+
+          return res.status(
+            responseOperacional.status === 409
+              ? 409
+              : 502
+          ).json({
+            error:
+              retornoOperacional?.error ||
+              'O Operacional não conseguiu liberar a OS para execução.'
+          });
+        }
+      } catch (error) {
+        await client.query('rollback');
+
+        console.error(
+          '[Mantezia Orçamentos] Falha ao liberar OS no Operacional:',
+          error
+        );
+
+        return res.status(502).json({
+          error:
+            'Não foi possível comunicar com o Mantezia Operacional.'
+        });
+      }
     }
 
     await client.query(
       `
       update orcamentos.quotes
-      set status = $3
+      set
+        status = $3,
+        approved_at = case
+          when $3 = 'approved' then now()
+          else approved_at
+        end,
+        rejected_at = case
+          when $3 = 'rejected' then now()
+          else rejected_at
+        end
       where id = $1
         and organization_id = $2
       `,
@@ -946,6 +1050,8 @@ app.listen(PORT, '0.0.0.0', () => {
     `[Mantezia Orçamentos] v0.1.0 ativo na porta ${PORT}`
   );
 });
+
+
 
 
 

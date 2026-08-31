@@ -195,6 +195,7 @@ export default function OrcamentoApp() {
   const [editando, setEditando] = useState(false);
   const [salvando, setSalvando] = useState(false);
   const [enviandoAprovacao, setEnviandoAprovacao] = useState(false);
+  const [alterandoStatus, setAlterandoStatus] = useState(false);
   const [rascunho, setRascunho] = useState<RascunhoOrcamento>({
     validadeIso: '',
     garantiaDias: 90,
@@ -402,6 +403,102 @@ export default function OrcamentoApp() {
       setEnviandoAprovacao(false);
     }
   };
+  const alterarStatusAprovacao = async (
+    novoStatus: 'approved' | 'rejected'
+  ) => {
+    if (
+      !selecionado.databaseId ||
+      alterandoStatus ||
+      selecionado.status !== 'Aguardando aprovação'
+    ) return;
+
+    const aprovando = novoStatus === 'approved';
+
+    const confirmar = window.confirm(
+      aprovando
+        ? `Confirmar aprovação do orçamento ${selecionado.codigo}?`
+        : `Confirmar rejeição do orçamento ${selecionado.codigo}?`
+    );
+
+    if (!confirmar) return;
+
+    let motivo = aprovando
+      ? 'Proposta aprovada'
+      : 'Proposta rejeitada';
+
+    if (!aprovando) {
+      const informado = window.prompt(
+        'Motivo da rejeição (opcional):',
+        ''
+      );
+
+      if (informado === null) return;
+
+      if (informado.trim()) {
+        motivo = informado.trim();
+      }
+    }
+
+    setAlterandoStatus(true);
+
+    try {
+      const response = await fetch(
+        `/api/orcamentos/${selecionado.databaseId}/status`,
+        {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            status: novoStatus,
+            changedBy: 'Cliente / Administrativo',
+            reason: motivo
+          })
+        }
+      );
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(
+          data?.error || `API respondeu ${response.status}`
+        );
+      }
+
+      const atualizado = mapearOrcamento(data.orcamento);
+
+      setOrcamentos(lista =>
+        lista.map(item =>
+          item.databaseId === atualizado.databaseId
+            ? atualizado
+            : item
+        )
+      );
+
+      setSelecionado(atualizado);
+      setEditando(false);
+
+      demonstrar(
+        aprovando
+          ? 'Orçamento aprovado.'
+          : 'Orçamento rejeitado.'
+      );
+    } catch (error) {
+      console.error(
+        '[Mantezia Orçamentos] Falha ao alterar aprovação:',
+        error
+      );
+
+      demonstrar(
+        error instanceof Error
+          ? error.message
+          : 'Não foi possível alterar o status.'
+      );
+    } finally {
+      setAlterandoStatus(false);
+    }
+  };
+
   const salvarOrcamento = async () => {
     if (!selecionado.databaseId || salvando) return;
 
@@ -1189,16 +1286,44 @@ export default function OrcamentoApp() {
                     </button>
                   )}
 
-                  <button
-                    className="secondary"
-                    onClick={() =>
-                      demonstrar(
-                        'Conversão em OS será liberada após aprovação'
-                      )
-                    }
-                  >
-                    Converter em OS
-                  </button>
+                  {selecionado.status === 'Aguardando aprovação' && (
+                    <>
+                      <button
+                        className="secondary approve"
+                        disabled={alterandoStatus}
+                        onClick={() =>
+                          void alterarStatusAprovacao('approved')
+                        }
+                      >
+                        {alterandoStatus
+                          ? 'Processando...'
+                          : 'Aprovar'}
+                      </button>
+
+                      <button
+                        className="secondary"
+                        disabled={alterandoStatus}
+                        onClick={() =>
+                          void alterarStatusAprovacao('rejected')
+                        }
+                      >
+                        Rejeitar
+                      </button>
+                    </>
+                  )}
+
+                  {selecionado.status === 'Aprovado' && (
+                    <button
+                      className="secondary approve"
+                      onClick={() =>
+                        demonstrar(
+                          'Conversão em OS será implementada na próxima etapa'
+                        )
+                      }
+                    >
+                      Converter em OS
+                    </button>
+                  )}
                 </div>
 
                 <div className="footnote">
@@ -1214,6 +1339,7 @@ export default function OrcamentoApp() {
     </div>
   );
 }
+
 
 
 
