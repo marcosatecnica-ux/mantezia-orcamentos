@@ -15,6 +15,8 @@ type Orcamento = {
   cliente: string;
   equipamento: string;
   descricao: string;
+  causa: string;
+  recomendacao: string;
   tecnico: string;
   status: StatusOrcamento;
   valor: number;
@@ -34,6 +36,9 @@ type Orcamento = {
 };
 
 type RascunhoOrcamento = {
+  diagnostico?: string;
+  causa?: string;
+  recomendacao?: string;
   validadeIso: string;
   garantiaDias: number;
   prazoExecucaoDias: number | null;
@@ -56,6 +61,7 @@ type OrcamentoApi = {
   equipment: string;
   technician_name?: string | null;
   technical_diagnosis?: string | null;
+  technical_cause?: string | null;
   technical_recommendation?: string | null;
   status: string;
   valid_until?: string | null;
@@ -81,6 +87,8 @@ const ORCAMENTO_VAZIO: Orcamento = {
   cliente: '',
   equipamento: '',
   descricao: '',
+  causa: '',
+  recomendacao: '',
   tecnico: '',
   status: 'Em elaboração',
   valor: 0,
@@ -138,6 +146,8 @@ const mapearOrcamento = (item: OrcamentoApi): Orcamento => ({
     item.technical_diagnosis ||
     item.technical_recommendation ||
     'Diagnóstico técnico ainda não informado.',
+  causa: item.technical_cause || '',
+  recomendacao: item.technical_recommendation || '',
   tecnico: item.technician_name || 'Não informado',
   status: statusApiParaTela(item.status),
   valor: Number(item.total || 0),
@@ -196,6 +206,7 @@ export default function OrcamentoApp() {
   const [salvando, setSalvando] = useState(false);
   const [enviandoAprovacao, setEnviandoAprovacao] = useState(false);
   const [alterandoStatus, setAlterandoStatus] = useState(false);
+  const [organizandoIa, setOrganizandoIa] = useState(false);
   const [rascunho, setRascunho] = useState<RascunhoOrcamento>({
     validadeIso: '',
     garantiaDias: 90,
@@ -339,6 +350,222 @@ export default function OrcamentoApp() {
       ...atual,
       itens: atual.itens.filter((_,i) => i !== index)
     }));
+  };
+
+  const organizarComIA = async () => {
+    if (
+      !selecionado.databaseId ||
+      organizandoIa ||
+      selecionado.status !== 'Em elaboração'
+    ) return;
+
+    setOrganizandoIa(true);
+
+    try {
+      const response = await fetch(
+        `/api/orcamentos/${selecionado.databaseId}/organizar-ia`,
+        { method: 'POST' }
+      );
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(
+          data?.error ||
+          'Não foi possível organizar o orçamento com IA.'
+        );
+      }
+
+      const sugestao = data?.sugestao || {};
+
+      setRascunho(atual => {
+        const descricoes = Array.isArray(sugestao.itens)
+          ? sugestao.itens
+              .map((item: unknown) => String(item || '').trim())
+              .filter(Boolean)
+          : [];
+
+        const itens =
+          descricoes.length > 0
+            ? descricoes.map((descricao: string,index: number) => {
+                const existente = atual.itens[index];
+
+                return {
+                  descricao,
+                  quantidade: existente?.quantidade ?? 1,
+                  unitario: existente?.unitario ?? 0
+                };
+              })
+            : atual.itens;
+
+        return {
+          ...atual,
+          diagnostico:
+            String(sugestao.diagnostico || '').trim() ||
+            selecionado.descricao,
+          causa:
+            String(sugestao.causa || '').trim() ||
+            selecionado.causa,
+          recomendacao:
+            String(sugestao.recomendacao || '').trim() ||
+            selecionado.recomendacao,
+          itens
+        };
+      });
+
+      setEditando(true);
+
+      demonstrar(
+        'IA organizou a parte técnica. Revise antes de salvar.'
+      );
+
+    } catch (error) {
+      console.error(
+        '[Mantezia Orçamentos] Falha na organização com IA:',
+        error
+      );
+
+      demonstrar(
+        error instanceof Error
+          ? error.message
+          : 'Não foi possível organizar com IA.'
+      );
+
+    } finally {
+      setOrganizandoIa(false);
+    }
+  };
+
+
+  const salvarOrcamentoCompleto = async () => {
+    if (!selecionado.databaseId || salvando) return;
+
+    if (
+      rascunho.itens.some(
+        item =>
+          !item.descricao.trim() ||
+          Number(item.quantidade) <= 0 ||
+          Number(item.unitario) < 0
+      )
+    ) {
+      demonstrar('Revise os itens do orçamento.');
+      return;
+    }
+
+    setSalvando(true);
+
+    try {
+      const comercialResponse = await fetch(
+        `/api/orcamentos/${selecionado.databaseId}`,
+        {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            validUntil: rascunho.validadeIso || null,
+            warrantyDays: rascunho.garantiaDias,
+            executionDays: rascunho.prazoExecucaoDias,
+            paymentTerms: rascunho.condicoesPagamento,
+            notes: rascunho.observacoes,
+            discount: rascunho.desconto,
+            items: rascunho.itens.map(item => ({
+              description: item.descricao,
+              quantity: item.quantidade,
+              unitPrice: item.unitario
+            }))
+          })
+        }
+      );
+
+      const comercialData = await comercialResponse.json();
+
+      if (!comercialResponse.ok) {
+        throw new Error(
+          comercialData?.error ||
+          'Não foi possível salvar os dados comerciais.'
+        );
+      }
+
+      const tecnicoResponse = await fetch(
+        `/api/orcamentos/${selecionado.databaseId}/tecnico`,
+        {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            technicalDiagnosis:
+              rascunho.diagnostico ??
+              selecionado.descricao,
+            technicalCause:
+              rascunho.causa ??
+              selecionado.causa,
+            technicalRecommendation:
+              rascunho.recomendacao ??
+              selecionado.recomendacao
+          })
+        }
+      );
+
+      const tecnicoData = await tecnicoResponse.json();
+
+      if (!tecnicoResponse.ok) {
+        throw new Error(
+          tecnicoData?.error ||
+          'Não foi possível salvar a parte técnica.'
+        );
+      }
+
+      const listaResponse = await fetch('/api/orcamentos');
+      const listaData = await listaResponse.json();
+
+      if (!listaResponse.ok) {
+        throw new Error(
+          listaData?.error ||
+          'Orçamento salvo, mas não foi possível atualizar a tela.'
+        );
+      }
+
+      const encontrado = Array.isArray(listaData.orcamentos)
+        ? listaData.orcamentos.find(
+            (item: OrcamentoApi) =>
+              item.id === selecionado.databaseId
+          )
+        : null;
+
+      if (encontrado) {
+        const atualizado = mapearOrcamento(encontrado);
+
+        setOrcamentos(lista =>
+          lista.map(item =>
+            item.databaseId === atualizado.databaseId
+              ? atualizado
+              : item
+          )
+        );
+
+        setSelecionado(atualizado);
+      }
+
+      setEditando(false);
+      demonstrar('Orçamento salvo com sucesso.');
+
+    } catch (error) {
+      console.error(
+        '[Mantezia Orçamentos] Falha ao salvar:',
+        error
+      );
+
+      demonstrar(
+        error instanceof Error
+          ? error.message
+          : 'Não foi possível salvar o orçamento.'
+      );
+
+    } finally {
+      setSalvando(false);
+    }
   };
 
   const enviarParaAprovacao = async () => {
@@ -617,8 +844,8 @@ export default function OrcamentoApp() {
     item => item.status === 'Aprovado'
   ).length;
 
-  const convertidos = orcamentos.filter(
-    item => item.status === 'Convertido em OS'
+  const rejeitados = orcamentos.filter(
+    item => item.status === 'Rejeitado'
   ).length;
   const demonstrar = (texto: string) => {
     setMensagem(texto);
@@ -688,7 +915,47 @@ export default function OrcamentoApp() {
         .card-label { font-size:12px; color:#7a8c9b; font-weight:700; }
         .card-value { margin-top:8px; font-size:25px; font-weight:850; color:#15364f; }
         .card-value.money { font-size:20px; }
-        .content-grid { display:grid; grid-template-columns:minmax(480px,1.08fr) minmax(430px,.92fr); gap:18px; }
+        .content-grid {
+          display:grid;
+          grid-template-columns:minmax(0,1fr) 360px;
+          gap:18px;
+          align-items:start;
+        }
+
+        .content-grid > .panel:first-child {
+          order:2;
+          position:sticky;
+          top:90px;
+          align-self:start;
+          max-height:calc(100vh - 112px);
+          overflow:auto;
+        }
+
+        .content-grid > .panel:nth-child(2) {
+          order:1;
+          min-width:0;
+        }
+
+        .content-grid > .panel:first-child .panel-head {
+          flex-direction:column;
+          align-items:stretch;
+          gap:10px;
+        }
+
+        .content-grid > .panel:first-child .search {
+          width:100%;
+        }
+
+        .content-grid > .panel:first-child .row {
+          grid-template-columns:1fr;
+          gap:6px;
+          border-bottom:1px solid #edf1f5;
+        }
+
+        .content-grid > .panel:first-child .value {
+          text-align:left;
+          color:#087b73;
+        }
         .panel { background:white; border:1px solid #e5ebf1; border-radius:14px; overflow:hidden; }
         .panel-head { padding:17px 18px; border-bottom:1px solid #edf1f5; display:flex; justify-content:space-between; align-items:center; }
         .panel-title { font-weight:800; color:#19384f; }
@@ -722,6 +989,69 @@ export default function OrcamentoApp() {
         .label { font-size:10px; color:#8a98a5; font-weight:700; }
         .info { margin-top:3px; font-size:13px; font-weight:700; color:#304b60; }
         .diagnosis { background:#f7fafc; border-radius:9px; padding:12px; font-size:13px; color:#455f73; line-height:1.45; }
+
+        .section-title-line {
+          display:flex;
+          align-items:center;
+          justify-content:space-between;
+          gap:12px;
+          margin-bottom:10px;
+        }
+
+        .section-title-line .section-title {
+          margin-bottom:0;
+        }
+
+        .ai-button {
+          border:1px solid #c9ddd9;
+          background:#eef8f7;
+          color:#087b73;
+          padding:8px 12px;
+          border-radius:9px;
+          font-size:11px;
+          font-weight:850;
+          cursor:pointer;
+        }
+
+        .ai-button:hover {
+          background:#ddf2ef;
+        }
+
+        .ai-button:disabled {
+          opacity:.55;
+          cursor:not-allowed;
+        }
+
+        .technical-editor,
+        .technical-read {
+          display:grid;
+          gap:10px;
+        }
+
+        .technical-editor label {
+          display:grid;
+          gap:5px;
+        }
+
+        .ai-warning {
+          background:#fff9e8;
+          border:1px solid #f3df9c;
+          color:#735c17;
+          padding:10px 12px;
+          border-radius:9px;
+          font-size:11px;
+          line-height:1.4;
+        }
+
+        .approved-note {
+          background:#e7f7ed;
+          border:1px solid #bfe5cc;
+          color:#187143;
+          padding:10px 12px;
+          border-radius:9px;
+          font-size:12px;
+          font-weight:800;
+        }
         .itemline { display:grid; grid-template-columns:1fr 50px 100px; gap:8px; padding:9px 0; border-bottom:1px solid #f0f3f5; font-size:12px; }
         .total-line { display:flex; justify-content:space-between; padding-top:14px; font-size:17px; font-weight:850; color:#0d675f; }
         .actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:18px; }
@@ -740,6 +1070,10 @@ export default function OrcamentoApp() {
         @media (max-width:1100px) {
           .cards { grid-template-columns:repeat(2,1fr); }
           .content-grid { grid-template-columns:1fr; }
+          .content-grid > .panel:first-child {
+            position:static;
+            max-height:none;
+          }
         }
         @media (max-width:780px) {
           .layout { grid-template-columns:1fr; }
@@ -801,12 +1135,12 @@ export default function OrcamentoApp() {
               <div className="card-value">{aguardandoAprovacao}</div>
             </div>
             <div className="card">
-              <div className="card-label">Aprovados</div>
+              <div className="card-label">Liberados para execução</div>
               <div className="card-value">{aprovados}</div>
             </div>
             <div className="card">
-              <div className="card-label">Convertidos em OS</div>
-              <div className="card-value">{convertidos}</div>
+              <div className="card-label">Rejeitados</div>
+              <div className="card-value">{rejeitados}</div>
             </div>
             <div className="card">
               <div className="card-label">Valor em propostas</div>
@@ -817,17 +1151,22 @@ export default function OrcamentoApp() {
           <div className="content-grid">
             <section className="panel">
               <div className="panel-head">
-                <div className="panel-title">Orçamentos recentes</div>
+                <div className="panel-title">Pendências</div>
                 <input
                   className="search"
-                  placeholder="Buscar cliente ou orçamento..."
+                  placeholder="Buscar pendência..."
                   value={busca}
                   onChange={e => setBusca(e.target.value)}
                 />
               </div>
 
               <div className="rows">
-                {filtrados.map(item => (
+                {filtrados
+                  .filter(item =>
+                    ['Em elaboração','Aguardando aprovação']
+                      .includes(item.status)
+                  )
+                  .map(item => (
                   <div
                     key={item.id}
                     className={`row ${selecionado.id === item.id ? 'selected' : ''}`}
@@ -892,8 +1231,118 @@ export default function OrcamentoApp() {
                 </div>
 
                 <div className="section">
-                  <div className="section-title">Diagnóstico técnico</div>
-                  <div className="diagnosis">{selecionado.descricao}</div>
+                  <div className="section-title-line">
+                    <div className="section-title">
+                      Diagnóstico técnico
+                    </div>
+
+                    {selecionado.status === 'Em elaboração' && (
+                      <button
+                        className="ai-button"
+                        disabled={organizandoIa}
+                        onClick={() => void organizarComIA()}
+                      >
+                        {organizandoIa
+                          ? '✨ Organizando...'
+                          : '✨ Organizar com IA'}
+                      </button>
+                    )}
+                  </div>
+
+                  {editando ? (
+                    <div className="technical-editor">
+                      <label>
+                        <span className="label">DIAGNÓSTICO</span>
+                        <textarea
+                          className="edit-input"
+                          rows={4}
+                          value={
+                            rascunho.diagnostico ??
+                            selecionado.descricao
+                          }
+                          onChange={e =>
+                            setRascunho(atual => ({
+                              ...atual,
+                              diagnostico:e.target.value
+                            }))
+                          }
+                        />
+                      </label>
+
+                      <label>
+                        <span className="label">CAUSA</span>
+                        <textarea
+                          className="edit-input"
+                          rows={3}
+                          value={
+                            rascunho.causa ??
+                            selecionado.causa
+                          }
+                          onChange={e =>
+                            setRascunho(atual => ({
+                              ...atual,
+                              causa:e.target.value
+                            }))
+                          }
+                        />
+                      </label>
+
+                      <label>
+                        <span className="label">
+                          SERVIÇO RECOMENDADO
+                        </span>
+                        <textarea
+                          className="edit-input"
+                          rows={3}
+                          value={
+                            rascunho.recomendacao ??
+                            selecionado.recomendacao
+                          }
+                          onChange={e =>
+                            setRascunho(atual => ({
+                              ...atual,
+                              recomendacao:e.target.value
+                            }))
+                          }
+                        />
+                      </label>
+
+                      <div className="ai-warning">
+                        A IA organiza apenas a informação técnica.
+                        Valores e condições comerciais continuam sob
+                        responsabilidade da assistência.
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="technical-read">
+                      <div>
+                        <div className="label">DIAGNÓSTICO</div>
+                        <div className="diagnosis">
+                          {selecionado.descricao}
+                        </div>
+                      </div>
+
+                      {selecionado.causa && (
+                        <div>
+                          <div className="label">CAUSA</div>
+                          <div className="diagnosis">
+                            {selecionado.causa}
+                          </div>
+                        </div>
+                      )}
+
+                      {selecionado.recomendacao && (
+                        <div>
+                          <div className="label">
+                            SERVIÇO RECOMENDADO
+                          </div>
+                          <div className="diagnosis">
+                            {selecionado.recomendacao}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
 
                 <div className="section">
@@ -1196,7 +1645,7 @@ export default function OrcamentoApp() {
                         <button
                           className="secondary approve"
                           disabled={salvando}
-                          onClick={salvarOrcamento}
+                          onClick={salvarOrcamentoCompleto}
                         >
                           {salvando
                             ? 'Salvando...'
@@ -1313,16 +1762,10 @@ export default function OrcamentoApp() {
                   )}
 
                   {selecionado.status === 'Aprovado' && (
-                    <button
-                      className="secondary approve"
-                      onClick={() =>
-                        demonstrar(
-                          'Conversão em OS será implementada na próxima etapa'
-                        )
-                      }
-                    >
-                      Converter em OS
-                    </button>
+                    <div className="approved-note">
+                      ✓ Orçamento aprovado. A mesma OS de origem foi
+                      liberada para continuar a execução.
+                    </div>
                   )}
                 </div>
 
@@ -1339,7 +1782,4 @@ export default function OrcamentoApp() {
     </div>
   );
 }
-
-
-
 

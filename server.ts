@@ -17,6 +17,12 @@ const operacionalUrl =
 const orcamentosIntegrationKey =
   process.env.ORCAMENTOS_INTEGRATION_KEY?.trim();
 
+const openaiApiKey =
+  process.env.OPENAI_API_KEY?.trim();
+
+const openaiModel =
+  process.env.OPENAI_MODEL?.trim();
+
 const pool = databaseUrl
   ? new Pool({
       connectionString: databaseUrl,
@@ -761,6 +767,298 @@ app.put('/api/orcamentos/:id', async (req, res) => {
     client.release();
   }
 });
+app.put('/api/orcamentos/:id/tecnico', async (req, res) => {
+  if (!pool) {
+    return res.status(503).json({
+      error: 'Banco de dados não configurado.'
+    });
+  }
+
+  const organizationId =
+    process.env.COMPANY_ID?.trim();
+
+  if (!organizationId) {
+    return res.status(503).json({
+      error: 'COMPANY_ID não configurado.'
+    });
+  }
+
+  const quoteId =
+    String(req.params.id || '').trim();
+
+  const technicalDiagnosis =
+    String(req.body?.technicalDiagnosis || '').trim();
+
+  const technicalCause =
+    String(req.body?.technicalCause || '').trim();
+
+  const technicalRecommendation =
+    String(req.body?.technicalRecommendation || '').trim();
+
+  if (technicalDiagnosis.length < 3) {
+    return res.status(400).json({
+      error: 'Informe o diagnóstico técnico.'
+    });
+  }
+
+  try {
+    const result = await pool.query(
+      `
+      update orcamentos.quotes
+      set
+        technical_diagnosis = $3,
+        technical_cause = $4,
+        technical_recommendation = $5,
+        updated_at = now()
+      where id = $1
+        and organization_id = $2
+        and status = 'draft'
+      returning
+        id,
+        technical_diagnosis,
+        technical_cause,
+        technical_recommendation
+      `,
+      [
+        quoteId,
+        organizationId,
+        technicalDiagnosis,
+        technicalCause,
+        technicalRecommendation
+      ]
+    );
+
+    if (!result.rowCount) {
+      return res.status(409).json({
+        error:
+          'Somente orçamentos em elaboração podem ser alterados.'
+      });
+    }
+
+    return res.json({
+      ok:true,
+      orcamento:result.rows[0]
+    });
+
+  } catch (error) {
+    console.error(
+      '[Mantezia Orçamentos] Falha ao salvar parte técnica:',
+      error
+    );
+
+    return res.status(500).json({
+      error:'Não foi possível salvar a parte técnica.'
+    });
+  }
+});
+
+
+app.post('/api/orcamentos/:id/organizar-ia', async (req, res) => {
+  if (!pool) {
+    return res.status(503).json({
+      error:'Banco de dados não configurado.'
+    });
+  }
+
+  if (!openaiApiKey || !openaiModel) {
+    return res.status(503).json({
+      error:
+        'IA do Mantezia Orçamentos ainda não está configurada.'
+    });
+  }
+
+  const organizationId =
+    process.env.COMPANY_ID?.trim();
+
+  if (!organizationId) {
+    return res.status(503).json({
+      error:'COMPANY_ID não configurado.'
+    });
+  }
+
+  const quoteId =
+    String(req.params.id || '').trim();
+
+  try {
+    const quoteResult = await pool.query(
+      `
+      select
+        id,
+        code,
+        equipment,
+        technical_diagnosis,
+        technical_cause,
+        technical_recommendation,
+        status
+      from orcamentos.quotes
+      where id = $1
+        and organization_id = $2
+      `,
+      [quoteId,organizationId]
+    );
+
+    if (!quoteResult.rowCount) {
+      return res.status(404).json({
+        error:'Orçamento não encontrado.'
+      });
+    }
+
+    const quote = quoteResult.rows[0];
+
+    if (quote.status !== 'draft') {
+      return res.status(409).json({
+        error:
+          'A IA só pode organizar orçamentos em elaboração.'
+      });
+    }
+
+    const itemsResult = await pool.query(
+      `
+      select
+        description,
+        quantity
+      from orcamentos.quote_items
+      where quote_id = $1
+      order by sort_order, created_at
+      `,
+      [quoteId]
+    );
+
+    /*
+      IMPORTANTE:
+      nenhum valor monetário é enviado para a IA.
+      Ela recebe apenas informação técnica.
+    */
+    const contexto = {
+      equipamento:
+        String(quote.equipment || ''),
+      diagnostico:
+        String(quote.technical_diagnosis || ''),
+      causa:
+        String(quote.technical_cause || ''),
+      recomendacao:
+        String(quote.technical_recommendation || ''),
+      itens:
+        itemsResult.rows.map(item => ({
+          descricao:String(item.description || ''),
+          quantidade:Number(item.quantity || 1)
+        }))
+    };
+
+    const aiResponse = await fetch(
+      'https://api.openai.com/v1/responses',
+      {
+        method:'POST',
+        headers:{
+          'content-type':'application/json',
+          'authorization':`Bearer ${openaiApiKey}`
+        },
+        body:JSON.stringify({
+          model:openaiModel,
+          store:false,
+          instructions:
+            'Você organiza propostas técnicas de assistência ' +
+            'Mantezia. Preserve os fatos fornecidos. Não invente ' +
+            'defeitos, peças ou serviços. Não calcule, sugira, ' +
+            'avalie ou altere preços. Organize o diagnóstico, a ' +
+            'causa, a recomendação técnica e descrições claras ' +
+            'dos itens. Responda em português do Brasil.',
+          input:
+            'Organize estes dados técnicos para um orçamento. ' +
+            'Não inclua preços ou valores monetários:\n' +
+            JSON.stringify(contexto),
+          text:{
+            format:{
+              type:'json_schema',
+              name:'orcamento_mantezia_organizado',
+              strict:true,
+              schema:{
+                type:'object',
+                additionalProperties:false,
+                properties:{
+                  diagnostico:{type:'string'},
+                  causa:{type:'string'},
+                  recomendacao:{type:'string'},
+                  itens:{
+                    type:'array',
+                    items:{type:'string'}
+                  }
+                },
+                required:[
+                  'diagnostico',
+                  'causa',
+                  'recomendacao',
+                  'itens'
+                ]
+              }
+            }
+          }
+        }),
+        signal:AbortSignal.timeout(30000)
+      }
+    );
+
+    const aiData = await aiResponse.json() as any;
+
+    if (!aiResponse.ok) {
+      console.error(
+        '[Mantezia Orçamentos] OpenAI respondeu:',
+        aiResponse.status,
+        aiData?.error?.message || aiData
+      );
+
+      return res.status(502).json({
+        error:
+          'A IA não conseguiu organizar o orçamento agora.'
+      });
+    }
+
+    const outputText =
+      typeof aiData?.output_text === 'string'
+        ? aiData.output_text
+        : Array.isArray(aiData?.output)
+          ? aiData.output
+              .flatMap((item:any) =>
+                Array.isArray(item?.content)
+                  ? item.content
+                  : []
+              )
+              .filter(
+                (item:any) =>
+                  item?.type === 'output_text' &&
+                  typeof item?.text === 'string'
+              )
+              .map((item:any) => item.text)
+              .join('')
+          : '';
+
+    if (!outputText.trim()) {
+      return res.status(502).json({
+        error:
+          'A IA respondeu sem conteúdo utilizável.'
+      });
+    }
+
+    const sugestao = JSON.parse(outputText);
+
+    return res.json({
+      ok:true,
+      sugestao
+    });
+
+  } catch (error) {
+    console.error(
+      '[Mantezia Orçamentos] Falha na organização com IA:',
+      error
+    );
+
+    return res.status(502).json({
+      error:
+        'Não foi possível organizar o orçamento com IA.'
+    });
+  }
+});
+
 app.put('/api/orcamentos/:id/status', async (req, res) => {
   if (!pool) {
     return res.status(503).json({
@@ -1050,11 +1348,3 @@ app.listen(PORT, '0.0.0.0', () => {
     `[Mantezia Orçamentos] v0.1.0 ativo na porta ${PORT}`
   );
 });
-
-
-
-
-
-
-
-
