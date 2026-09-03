@@ -4,7 +4,6 @@ type StatusOrcamento =
   | 'Aguardando aprovação'
   | 'Em elaboração'
   | 'Aprovado'
-  | 'Convertido em OS'
   | 'Rejeitado'
   | 'Expirado'
   | 'Cancelado';
@@ -13,6 +12,8 @@ type Orcamento = {
   id: string;
   databaseId: string;
   cliente: string;
+  telefone: string;
+  email: string;
   equipamento: string;
   descricao: string;
   causa: string;
@@ -58,6 +59,8 @@ type OrcamentoApi = {
   source_order_id?: string | null;
   source_order_code?: string | null;
   client_name: string;
+  client_phone?: string | null;
+  client_email?: string | null;
   equipment: string;
   technician_name?: string | null;
   technical_diagnosis?: string | null;
@@ -85,6 +88,8 @@ const ORCAMENTO_VAZIO: Orcamento = {
   id: '',
   databaseId: '',
   cliente: '',
+  telefone: '',
+  email: '',
   equipamento: '',
   descricao: '',
   causa: '',
@@ -110,7 +115,7 @@ const statusApiParaTela = (status: string): StatusOrcamento => {
     case 'approved':
       return 'Aprovado';
     case 'converted':
-      return 'Convertido em OS';
+      return 'Aprovado';
     case 'rejected':
       return 'Rejeitado';
     case 'expired':
@@ -141,6 +146,8 @@ const mapearOrcamento = (item: OrcamentoApi): Orcamento => ({
   id: item.code,
   databaseId: item.id,
   cliente: item.client_name,
+  telefone: item.client_phone || '',
+  email: item.client_email || '',
   equipamento: item.equipment,
   descricao:
     item.technical_diagnosis ||
@@ -178,9 +185,26 @@ const moeda = (valor: number) =>
     currency: 'BRL',
   }).format(valor);
 
+const escaparHtml = (valor: unknown) =>
+  String(valor ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+
+const normalizarTelefoneWhatsApp = (valor: string) => {
+  const digitos = valor.replace(/\D/g, '');
+
+  if (!digitos) return '';
+
+  if (digitos.startsWith('55')) return digitos;
+
+  return `55${digitos}`;
+};
+
 const statusClass = (status: StatusOrcamento) => {
   if (status === 'Aprovado') return 'status aprovado';
-  if (status === 'Convertido em OS') return 'status convertido';
   if (status === 'Em elaboração') return 'status elaboracao';
 
   if (
@@ -188,7 +212,7 @@ const statusClass = (status: StatusOrcamento) => {
     status === 'Cancelado' ||
     status === 'Expirado'
   ) {
-    return 'status elaboracao';
+    return 'status rejeitado';
   }
 
   return 'status aguardando';
@@ -205,8 +229,8 @@ export default function OrcamentoApp() {
   const [editando, setEditando] = useState(false);
   const [salvando, setSalvando] = useState(false);
   const [enviandoAprovacao, setEnviandoAprovacao] = useState(false);
-  const [alterandoStatus, setAlterandoStatus] = useState(false);
   const [organizandoIa, setOrganizandoIa] = useState(false);
+  const [mostrarHistorico, setMostrarHistorico] = useState(false);
   const [rascunho, setRascunho] = useState<RascunhoOrcamento>({
     validadeIso: '',
     garantiaDias: 90,
@@ -282,6 +306,9 @@ export default function OrcamentoApp() {
 
   useEffect(() => {
     setRascunho({
+      diagnostico: selecionado.descricao,
+      causa: selecionado.causa,
+      recomendacao: selecionado.recomendacao,
       validadeIso: selecionado.validadeIso,
       garantiaDias: selecionado.garantiaDias,
       prazoExecucaoDias: selecionado.prazoExecucaoDias,
@@ -452,6 +479,14 @@ export default function OrcamentoApp() {
       return;
     }
 
+    if (
+      Number(rascunho.desconto) < 0 ||
+      Number(rascunho.desconto) > subtotalRascunho
+    ) {
+      demonstrar('Desconto inválido.');
+      return;
+    }
+
     setSalvando(true);
 
     try {
@@ -575,6 +610,16 @@ export default function OrcamentoApp() {
       selecionado.status !== 'Em elaboração'
     ) return;
 
+    if (
+      selecionado.itens.length === 0 ||
+      selecionado.valor <= 0
+    ) {
+      demonstrar(
+        'Salve pelo menos um item com valor antes de enviar para aprovação.'
+      );
+      return;
+    }
+
     setEnviandoAprovacao(true);
 
     try {
@@ -630,189 +675,345 @@ export default function OrcamentoApp() {
       setEnviandoAprovacao(false);
     }
   };
-  const alterarStatusAprovacao = async (
-    novoStatus: 'approved' | 'rejected'
-  ) => {
-    if (
-      !selecionado.databaseId ||
-      alterandoStatus ||
-      selecionado.status !== 'Aguardando aprovação'
-    ) return;
-
-    const aprovando = novoStatus === 'approved';
-
-    const confirmar = window.confirm(
-      aprovando
-        ? `Confirmar aprovação do orçamento ${selecionado.codigo}?`
-        : `Confirmar rejeição do orçamento ${selecionado.codigo}?`
-    );
-
-    if (!confirmar) return;
-
-    let motivo = aprovando
-      ? 'Proposta aprovada'
-      : 'Proposta rejeitada';
-
-    if (!aprovando) {
-      const informado = window.prompt(
-        'Motivo da rejeição (opcional):',
-        ''
-      );
-
-      if (informado === null) return;
-
-      if (informado.trim()) {
-        motivo = informado.trim();
-      }
-    }
-
-    setAlterandoStatus(true);
-
-    try {
-      const response = await fetch(
-        `/api/orcamentos/${selecionado.databaseId}/status`,
-        {
-          method: 'PUT',
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            status: novoStatus,
-            changedBy: 'Cliente / Administrativo',
-            reason: motivo
-          })
-        }
-      );
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(
-          data?.error || `API respondeu ${response.status}`
-        );
-      }
-
-      const atualizado = mapearOrcamento(data.orcamento);
-
-      setOrcamentos(lista =>
-        lista.map(item =>
-          item.databaseId === atualizado.databaseId
-            ? atualizado
-            : item
-        )
-      );
-
-      setSelecionado(atualizado);
-      setEditando(false);
-
-      demonstrar(
-        aprovando
-          ? 'Orçamento aprovado.'
-          : 'Orçamento rejeitado.'
-      );
-    } catch (error) {
-      console.error(
-        '[Mantezia Orçamentos] Falha ao alterar aprovação:',
-        error
-      );
-
-      demonstrar(
-        error instanceof Error
-          ? error.message
-          : 'Não foi possível alterar o status.'
-      );
-    } finally {
-      setAlterandoStatus(false);
-    }
-  };
-
-  const salvarOrcamento = async () => {
-    if (!selecionado.databaseId || salvando) return;
-
-    if (
-      rascunho.itens.some(
+  const resumoCompartilhamento = () => {
+    const itens = selecionado.itens
+      .map(
         item =>
-          !item.descricao.trim() ||
-          Number(item.quantidade) <= 0 ||
-          Number(item.unitario) < 0
+          `- ${item.quantidade}x ${item.descricao}: ` +
+          moeda(item.quantidade * item.unitario)
       )
-    ) {
-      demonstrar('Revise os itens do orçamento.');
-      return;
-    }
+      .join('\n');
 
-    if (
-      Number(rascunho.desconto) < 0 ||
-      Number(rascunho.desconto) > subtotalRascunho
-    ) {
-      demonstrar('Desconto inválido.');
-      return;
-    }
-
-    setSalvando(true);
-
-    try {
-      const response = await fetch(
-        `/api/orcamentos/${selecionado.databaseId}`,
-        {
-          method: 'PUT',
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            validUntil: rascunho.validadeIso || null,
-            warrantyDays: rascunho.garantiaDias,
-            executionDays: rascunho.prazoExecucaoDias,
-            paymentTerms:
-              rascunho.condicoesPagamento.trim() || null,
-            notes:
-              rascunho.observacoes.trim() || null,
-            discount: Number(rascunho.desconto) || 0,
-            items: rascunho.itens.map(item => ({
-              description: item.descricao.trim(),
-              quantity: Number(item.quantidade),
-              unitPrice: Number(item.unitario)
-            }))
-          })
-        }
-      );
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(
-          data?.error || `API respondeu ${response.status}`
-        );
-      }
-
-      const atualizado = mapearOrcamento(data.orcamento);
-
-      setOrcamentos(lista =>
-        lista.map(item =>
-          item.databaseId === atualizado.databaseId
-            ? atualizado
-            : item
-        )
-      );
-
-      setSelecionado(atualizado);
-      setEditando(false);
-      demonstrar('Orçamento salvo com sucesso.');
-    } catch (error) {
-      console.error(
-        '[Mantezia Orçamentos] Falha ao salvar:',
-        error
-      );
-
-      demonstrar(
-        error instanceof Error
-          ? error.message
-          : 'Não foi possível salvar o orçamento.'
-      );
-    } finally {
-      setSalvando(false);
-    }
+    return [
+      `Orçamento ${selecionado.id}`,
+      `Cliente: ${selecionado.cliente}`,
+      `Equipamento: ${selecionado.equipamento}`,
+      selecionado.origem && selecionado.origem !== '-'
+        ? `Origem: ${selecionado.origem}`
+        : '',
+      '',
+      `Diagnóstico: ${selecionado.descricao}`,
+      selecionado.causa ? `Causa: ${selecionado.causa}` : '',
+      selecionado.recomendacao
+        ? `Serviço recomendado: ${selecionado.recomendacao}`
+        : '',
+      '',
+      itens,
+      selecionado.desconto > 0
+        ? `Desconto: - ${moeda(selecionado.desconto)}`
+        : '',
+      `Total: ${moeda(selecionado.valor)}`,
+      `Validade: ${selecionado.validade}`,
+      `Garantia: ${selecionado.garantiaDias} dias`,
+      selecionado.prazoExecucaoDias == null
+        ? ''
+        : `Prazo estimado: ${selecionado.prazoExecucaoDias} dias`,
+      selecionado.condicoesPagamento
+        ? `Pagamento: ${selecionado.condicoesPagamento}`
+        : '',
+      selecionado.observacoes
+        ? `Observações: ${selecionado.observacoes}`
+        : ''
+    ]
+      .filter(Boolean)
+      .join('\n');
   };
+
+  const gerarPdf = () => {
+    if (!selecionado.databaseId) {
+      demonstrar('Selecione um orçamento.');
+      return;
+    }
+
+    const janela = window.open('', '_blank');
+
+    if (!janela) {
+      demonstrar(
+        'O navegador bloqueou a janela do PDF. Libere pop-ups e tente novamente.'
+      );
+      return;
+    }
+
+    const itensHtml = selecionado.itens
+      .map(
+        item => `
+          <tr>
+            <td>${escaparHtml(item.descricao)}</td>
+            <td>${escaparHtml(item.quantidade)}</td>
+            <td>${escaparHtml(moeda(item.unitario))}</td>
+            <td>${escaparHtml(
+              moeda(item.quantidade * item.unitario)
+            )}</td>
+          </tr>
+        `
+      )
+      .join('');
+
+    janela.document.write(`
+      <!doctype html>
+      <html lang="pt-BR">
+        <head>
+          <meta charset="utf-8" />
+          <title>${escaparHtml(selecionado.id)} - Mantezia Orçamentos</title>
+          <style>
+            * { box-sizing:border-box; }
+            body {
+              margin:0;
+              padding:36px;
+              color:#17324a;
+              font-family:Arial,Helvetica,sans-serif;
+              font-size:13px;
+            }
+            .head {
+              display:flex;
+              justify-content:space-between;
+              gap:24px;
+              padding-bottom:18px;
+              border-bottom:3px solid #0b7f78;
+            }
+            h1 { margin:0; font-size:24px; }
+            h2 {
+              margin:24px 0 8px;
+              font-size:13px;
+              text-transform:uppercase;
+              color:#647789;
+            }
+            .muted { color:#6b7d8d; }
+            .box {
+              background:#f6f9fb;
+              border:1px solid #e1e8ed;
+              border-radius:8px;
+              padding:12px;
+              line-height:1.5;
+            }
+            .grid {
+              display:grid;
+              grid-template-columns:1fr 1fr;
+              gap:10px 20px;
+              margin-top:18px;
+            }
+            .label {
+              display:block;
+              font-size:10px;
+              font-weight:700;
+              color:#7b8d9b;
+              text-transform:uppercase;
+              margin-bottom:3px;
+            }
+            table {
+              width:100%;
+              border-collapse:collapse;
+              margin-top:8px;
+            }
+            th,td {
+              border-bottom:1px solid #e7ecef;
+              padding:9px 6px;
+              text-align:left;
+            }
+            th {
+              font-size:10px;
+              text-transform:uppercase;
+              color:#718394;
+            }
+            td:nth-child(2),
+            td:nth-child(3),
+            td:nth-child(4),
+            th:nth-child(2),
+            th:nth-child(3),
+            th:nth-child(4) {
+              text-align:right;
+            }
+            .total {
+              margin-top:14px;
+              text-align:right;
+              font-size:20px;
+              font-weight:800;
+              color:#0b716b;
+            }
+            .footer {
+              margin-top:30px;
+              padding-top:12px;
+              border-top:1px solid #e5eaee;
+              font-size:10px;
+              color:#8795a1;
+              text-align:center;
+            }
+            @media print {
+              body { padding:18px; }
+            }
+          </style>
+        </head>
+        <body>
+          <div class="head">
+            <div>
+              <h1>Mantezia Orçamentos</h1>
+              <div class="muted">Proposta comercial</div>
+            </div>
+            <div style="text-align:right">
+              <strong>${escaparHtml(selecionado.id)}</strong><br/>
+              <span class="muted">Validade: ${escaparHtml(
+                selecionado.validade
+              )}</span>
+            </div>
+          </div>
+
+          <div class="grid">
+            <div>
+              <span class="label">Cliente</span>
+              <strong>${escaparHtml(selecionado.cliente)}</strong>
+            </div>
+            <div>
+              <span class="label">Equipamento</span>
+              <strong>${escaparHtml(selecionado.equipamento)}</strong>
+            </div>
+            <div>
+              <span class="label">Técnico responsável</span>
+              ${escaparHtml(selecionado.tecnico)}
+            </div>
+            <div>
+              <span class="label">Origem</span>
+              ${escaparHtml(selecionado.origem)}
+            </div>
+          </div>
+
+          <h2>Diagnóstico</h2>
+          <div class="box">${escaparHtml(selecionado.descricao)}</div>
+
+          ${
+            selecionado.causa
+              ? `<h2>Causa</h2><div class="box">${escaparHtml(
+                  selecionado.causa
+                )}</div>`
+              : ''
+          }
+
+          ${
+            selecionado.recomendacao
+              ? `<h2>Serviço recomendado</h2><div class="box">${escaparHtml(
+                  selecionado.recomendacao
+                )}</div>`
+              : ''
+          }
+
+          <h2>Itens da proposta</h2>
+          <table>
+            <thead>
+              <tr>
+                <th>Descrição</th>
+                <th>Qtd.</th>
+                <th>Unitário</th>
+                <th>Total</th>
+              </tr>
+            </thead>
+            <tbody>${itensHtml}</tbody>
+          </table>
+
+          ${
+            selecionado.desconto > 0
+              ? `<div style="margin-top:10px;text-align:right">
+                  Desconto: <strong>- ${escaparHtml(
+                    moeda(selecionado.desconto)
+                  )}</strong>
+                </div>`
+              : ''
+          }
+
+          <div class="total">
+            Total: ${escaparHtml(moeda(selecionado.valor))}
+          </div>
+
+          <h2>Condições comerciais</h2>
+          <div class="grid">
+            <div>
+              <span class="label">Garantia</span>
+              ${escaparHtml(selecionado.garantiaDias)} dias
+            </div>
+            <div>
+              <span class="label">Prazo estimado</span>
+              ${
+                selecionado.prazoExecucaoDias == null
+                  ? 'Não informado'
+                  : `${escaparHtml(
+                      selecionado.prazoExecucaoDias
+                    )} dias`
+              }
+            </div>
+            <div>
+              <span class="label">Pagamento</span>
+              ${escaparHtml(
+                selecionado.condicoesPagamento || 'Não informado'
+              )}
+            </div>
+            <div>
+              <span class="label">Validade</span>
+              ${escaparHtml(selecionado.validade)}
+            </div>
+          </div>
+
+          ${
+            selecionado.observacoes
+              ? `<h2>Observações</h2><div class="box">${escaparHtml(
+                  selecionado.observacoes
+                )}</div>`
+              : ''
+          }
+
+          <div class="footer">
+            Documento emitido pelo Mantezia Orçamentos.
+          </div>
+
+          <script>
+            window.addEventListener('load', () => {
+              setTimeout(() => window.print(), 250);
+            });
+          </script>
+        </body>
+      </html>
+    `);
+
+    janela.document.close();
+  };
+
+  const enviarEmail = () => {
+    if (!selecionado.databaseId) {
+      demonstrar('Selecione um orçamento.');
+      return;
+    }
+
+    if (!selecionado.email) {
+      demonstrar('Este cliente não possui e-mail cadastrado.');
+      return;
+    }
+
+    const assunto = `Orçamento ${selecionado.id} - ${selecionado.equipamento}`;
+    const body = resumoCompartilhamento();
+
+    window.location.href =
+      `mailto:${encodeURIComponent(selecionado.email)}` +
+      `?subject=${encodeURIComponent(assunto)}` +
+      `&body=${encodeURIComponent(body)}`;
+  };
+
+  const enviarWhatsApp = () => {
+    if (!selecionado.databaseId) {
+      demonstrar('Selecione um orçamento.');
+      return;
+    }
+
+    const mensagem =
+      `Olá, ${selecionado.cliente}.\n\n` +
+      resumoCompartilhamento();
+
+    const telefone =
+      normalizarTelefoneWhatsApp(selecionado.telefone);
+
+    const url = telefone
+      ? `https://wa.me/${telefone}?text=${encodeURIComponent(mensagem)}`
+      : `https://api.whatsapp.com/send?text=${encodeURIComponent(mensagem)}`;
+
+    window.open(url, '_blank', 'noopener,noreferrer');
+  };
+
   const filtrados = useMemo(() => {
     const termo = busca.toLowerCase().trim();
 
@@ -827,10 +1028,20 @@ export default function OrcamentoApp() {
     );
   }, [busca, orcamentos]);
 
-  const total = orcamentos.reduce(
-    (soma, item) => soma + item.valor,
-    0
+  const itensLista = filtrados.filter(item =>
+    mostrarHistorico
+      ? !['Em elaboração','Aguardando aprovação'].includes(item.status)
+      : ['Em elaboração','Aguardando aprovação'].includes(item.status)
   );
+
+  const totalEmAberto = orcamentos
+    .filter(item =>
+      ['Em elaboração','Aguardando aprovação'].includes(item.status)
+    )
+    .reduce(
+      (soma, item) => soma + item.valor,
+      0
+    );
 
   const emElaboracao = orcamentos.filter(
     item => item.status === 'Em elaboração'
@@ -891,7 +1102,7 @@ export default function OrcamentoApp() {
           border:1px solid rgba(255,255,255,.25); border-radius:999px;
           padding:8px 13px; font-size:12px; color:#d9e7f2;
         }
-        .layout { display:grid; grid-template-columns:250px 1fr; min-height:calc(100vh - 72px); }
+        .layout { min-height:calc(100vh - 72px); }
         .sidebar { background:white; border-right:1px solid #e5ebf1; padding:24px 16px; }
         .side-label { color:#8795a3; font-size:11px; font-weight:800; text-transform:uppercase; margin:8px 12px 12px; }
         .navitem {
@@ -906,6 +1117,17 @@ export default function OrcamentoApp() {
         .primary {
           border:0; padding:11px 17px; background:#07877f; color:white;
           border-radius:9px; font-weight:750; cursor:pointer;
+        }
+        .heading-note {
+          max-width:360px;
+          padding:10px 13px;
+          border:1px solid #d8e5e3;
+          background:#eef8f7;
+          color:#43625f;
+          border-radius:10px;
+          font-size:11px;
+          line-height:1.4;
+          font-weight:700;
         }
         .cards { display:grid; grid-template-columns:repeat(5,1fr); gap:14px; margin-bottom:22px; }
         .card {
@@ -959,6 +1181,26 @@ export default function OrcamentoApp() {
         .panel { background:white; border:1px solid #e5ebf1; border-radius:14px; overflow:hidden; }
         .panel-head { padding:17px 18px; border-bottom:1px solid #edf1f5; display:flex; justify-content:space-between; align-items:center; }
         .panel-title { font-weight:800; color:#19384f; }
+        .panel-head-tools {
+          display:flex;
+          gap:8px;
+          align-items:center;
+        }
+        .list-toggle {
+          border:0;
+          background:transparent;
+          color:#087b73;
+          font-size:10px;
+          font-weight:850;
+          cursor:pointer;
+          padding:4px 0;
+        }
+        .empty-state {
+          padding:24px 14px;
+          text-align:center;
+          color:#81909c;
+          font-size:12px;
+        }
         .search {
           width:230px; border:1px solid #d8e1e8; padding:9px 11px;
           border-radius:8px; outline:none; background:#fbfcfd;
@@ -978,7 +1220,7 @@ export default function OrcamentoApp() {
         .aguardando { background:#fff5da; color:#8a6100; }
         .elaboracao { background:#e8f0ff; color:#345e9d; }
         .aprovado { background:#e7f7ed; color:#187143; }
-        .convertido { background:#e8f6f5; color:#087b73; }
+        .rejeitado { background:#fdecec; color:#a12d2d; }
         .value { text-align:right; font-weight:800; font-size:13px; }
         .detail { padding:20px; }
         .detail-top { display:flex; justify-content:space-between; align-items:flex-start; gap:15px; margin-bottom:18px; }
@@ -1052,6 +1294,16 @@ export default function OrcamentoApp() {
           font-size:12px;
           font-weight:800;
         }
+        .pending-note {
+          background:#fff7df;
+          border:1px solid #eedb9b;
+          color:#725a13;
+          padding:10px 12px;
+          border-radius:9px;
+          font-size:12px;
+          font-weight:750;
+          line-height:1.4;
+        }
         .itemline { display:grid; grid-template-columns:1fr 50px 100px; gap:8px; padding:9px 0; border-bottom:1px solid #f0f3f5; font-size:12px; }
         .total-line { display:flex; justify-content:space-between; padding-top:14px; font-size:17px; font-weight:850; color:#0d675f; }
         .actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:18px; }
@@ -1076,8 +1328,7 @@ export default function OrcamentoApp() {
           }
         }
         @media (max-width:780px) {
-          .layout { grid-template-columns:1fr; }
-          .sidebar { display:none; }
+          .layout { min-height:calc(100vh - 72px); }
           .main { padding:16px; }
           .topbar { padding:0 16px; }
           .cards { grid-template-columns:1fr 1fr; }
@@ -1099,19 +1350,6 @@ export default function OrcamentoApp() {
       </header>
 
       <div className="layout">
-        <aside className="sidebar">
-          <div className="side-label">Comercial</div>
-          <div className="navitem active">▣ Visão Geral</div>
-          <div className="navitem">▤ Orçamentos</div>
-          <div className="navitem">✓ Aprovações</div>
-          <div className="navitem">◎ Clientes</div>
-
-          <div className="side-label" style={{marginTop:28}}>Integração</div>
-          <div className="navitem">↔ Ordens de Serviço</div>
-          <div className="navitem">◈ Indicadores</div>
-          <div className="navitem">⚙ Configurações</div>
-        </aside>
-
         <main className="main">
           <div className="heading">
             <div>
@@ -1120,9 +1358,11 @@ export default function OrcamentoApp() {
                 Propostas comerciais conectadas à operação técnica Mantezia.
               </div>
             </div>
-            <button className="primary" onClick={() => demonstrar('Novo orçamento — fluxo em conclusão')}>
-              + Novo orçamento
-            </button>
+            <div className="heading-note">
+              Os orçamentos operacionais são criados a partir das OS.
+              Assim, cliente, equipamento e histórico permanecem vinculados
+              ao mesmo atendimento.
+            </div>
           </div>
 
           <section className="cards">
@@ -1143,46 +1383,76 @@ export default function OrcamentoApp() {
               <div className="card-value">{rejeitados}</div>
             </div>
             <div className="card">
-              <div className="card-label">Valor em propostas</div>
-              <div className="card-value money">{moeda(total)}</div>
+              <div className="card-label">Valor em aberto</div>
+              <div className="card-value money">{moeda(totalEmAberto)}</div>
             </div>
           </section>
 
           <div className="content-grid">
             <section className="panel">
               <div className="panel-head">
-                <div className="panel-title">Pendências</div>
+                <div style={{
+                  display:'flex',
+                  alignItems:'center',
+                  justifyContent:'space-between',
+                  gap:10
+                }}>
+                  <div className="panel-title">
+                    {mostrarHistorico ? 'Histórico' : 'Pendências'}
+                  </div>
+
+                  <button
+                    type="button"
+                    className="list-toggle"
+                    onClick={() => {
+                      setMostrarHistorico(atual => !atual);
+                      setBusca('');
+                    }}
+                  >
+                    {mostrarHistorico ? 'Ver pendências' : 'Ver histórico'}
+                  </button>
+                </div>
+
                 <input
                   className="search"
-                  placeholder="Buscar pendência..."
+                  placeholder={
+                    mostrarHistorico
+                      ? 'Buscar no histórico...'
+                      : 'Buscar pendência...'
+                  }
                   value={busca}
                   onChange={e => setBusca(e.target.value)}
                 />
               </div>
 
               <div className="rows">
-                {filtrados
-                  .filter(item =>
-                    ['Em elaboração','Aguardando aprovação']
-                      .includes(item.status)
-                  )
-                  .map(item => (
-                  <div
-                    key={item.id}
-                    className={`row ${selecionado.id === item.id ? 'selected' : ''}`}
-                    onClick={() => setSelecionado(item)}
-                  >
-                    <div className="osid">{item.id}</div>
-                    <div>
-                      <div className="client">{item.cliente}</div>
-                      <div className="equipment">{item.equipamento}</div>
-                    </div>
-                    <div>
-                      <span className={statusClass(item.status)}>{item.status}</span>
-                    </div>
-                    <div className="value">{moeda(item.valor)}</div>
+                {itensLista.length === 0 ? (
+                  <div className="empty-state">
+                    {mostrarHistorico
+                      ? 'Nenhum orçamento no histórico.'
+                      : 'Nenhum orçamento aguardando ação.'}
                   </div>
-                ))}
+                ) : (
+                  itensLista.map(item => (
+                    <div
+                      key={item.id}
+                      className={`row ${selecionado.id === item.id ? 'selected' : ''}`}
+                      onClick={() => setSelecionado(item)}
+                    >
+                      <div className="osid">{item.id}</div>
+                      <div>
+                        <div className="client">{item.cliente}</div>
+                        <div className="equipment">{item.equipamento}</div>
+                      </div>
+                      <div>
+                        <span className={statusClass(item.status)}>
+                          {item.status}
+                        </span>
+                      </div>
+                      <div className="value">{moeda(item.valor)}</div>
+                    </div>
+                  ))
+                )}
               </div>
             </section>
 
@@ -1236,17 +1506,25 @@ export default function OrcamentoApp() {
                       Diagnóstico técnico
                     </div>
 
-                    {selecionado.status === 'Em elaboração' && (
-                      <button
-                        className="ai-button"
-                        disabled={organizandoIa}
-                        onClick={() => void organizarComIA()}
-                      >
-                        {organizandoIa
-                          ? '✨ Organizando...'
-                          : '✨ Organizar com IA'}
-                      </button>
-                    )}
+                    <button
+                      className="ai-button"
+                      disabled={
+                        organizandoIa ||
+                        selecionado.status !== 'Em elaboração'
+                      }
+                      title={
+                        selecionado.status === 'Em elaboração'
+                          ? 'Organizar diagnóstico, causa, serviço e itens com IA'
+                          : 'A IA fica disponível enquanto o orçamento está em elaboração'
+                      }
+                      onClick={() => void organizarComIA()}
+                    >
+                      {organizandoIa
+                        ? '✨ Organizando...'
+                        : selecionado.status === 'Em elaboração'
+                          ? '✨ Organizar com IA'
+                          : '✨ IA disponível na elaboração'}
+                    </button>
                   </div>
 
                   {editando ? (
@@ -1657,6 +1935,12 @@ export default function OrcamentoApp() {
                           disabled={salvando}
                           onClick={() => {
                             setRascunho({
+                              diagnostico:
+                                selecionado.descricao,
+                              causa:
+                                selecionado.causa,
+                              recomendacao:
+                                selecionado.recomendacao,
                               validadeIso:
                                 selecionado.validadeIso,
                               garantiaDias:
@@ -1692,33 +1976,21 @@ export default function OrcamentoApp() {
 
                   <button
                     className="secondary"
-                    onClick={() =>
-                      demonstrar(
-                        'Prévia do PDF preparada'
-                      )
-                    }
+                    onClick={gerarPdf}
                   >
                     Gerar PDF
                   </button>
 
                   <button
                     className="secondary"
-                    onClick={() =>
-                      demonstrar(
-                        'Envio por e-mail preparado'
-                      )
-                    }
+                    onClick={enviarEmail}
                   >
                     Enviar por e-mail
                   </button>
 
                   <button
                     className="secondary"
-                    onClick={() =>
-                      demonstrar(
-                        'Compartilhamento por WhatsApp preparado'
-                      )
-                    }
+                    onClick={enviarWhatsApp}
                   >
                     WhatsApp
                   </button>
@@ -1736,29 +2008,11 @@ export default function OrcamentoApp() {
                   )}
 
                   {selecionado.status === 'Aguardando aprovação' && (
-                    <>
-                      <button
-                        className="secondary approve"
-                        disabled={alterandoStatus}
-                        onClick={() =>
-                          void alterarStatusAprovacao('approved')
-                        }
-                      >
-                        {alterandoStatus
-                          ? 'Processando...'
-                          : 'Aprovar'}
-                      </button>
-
-                      <button
-                        className="secondary"
-                        disabled={alterandoStatus}
-                        onClick={() =>
-                          void alterarStatusAprovacao('rejected')
-                        }
-                      >
-                        Rejeitar
-                      </button>
-                    </>
+                    <div className="pending-note">
+                      Aguardando a decisão do cliente no Portal do Cliente.
+                      Aprovação e rejeição são registradas pelo acesso
+                      autenticado do próprio cliente.
+                    </div>
                   )}
 
                   {selecionado.status === 'Aprovado' && (

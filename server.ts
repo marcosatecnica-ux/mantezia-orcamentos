@@ -704,9 +704,12 @@ app.put('/api/orcamentos/:id', async (req, res) => {
         source_order_code,
         client_id,
         client_name,
+        client_phone,
+        client_email,
         equipment,
         technician_name,
         technical_diagnosis,
+        technical_cause,
         technical_recommendation,
         status,
         valid_until,
@@ -1100,6 +1103,24 @@ app.put('/api/orcamentos/:id/status', async (req, res) => {
     });
   }
 
+  if (['approved','rejected'].includes(novoStatus)) {
+    const integrationKey =
+      String(
+        req.headers['x-mantezia-integration-key'] || ''
+      ).trim();
+
+    if (
+      !orcamentosIntegrationKey ||
+      !integrationKey ||
+      integrationKey !== orcamentosIntegrationKey
+    ) {
+      return res.status(401).json({
+        error:
+          'Aprovação ou rejeição deve ser realizada pelo Portal do Cliente autenticado.'
+      });
+    }
+  }
+
   const client = await pool.connect();
 
   try {
@@ -1277,10 +1298,14 @@ app.put('/api/orcamentos/:id/status', async (req, res) => {
         q.code,
         q.source_order_id,
         q.source_order_code,
+        q.client_id,
         q.client_name,
+        q.client_phone,
+        q.client_email,
         q.equipment,
         q.technician_name,
         q.technical_diagnosis,
+        q.technical_cause,
         q.technical_recommendation,
         q.status,
         q.valid_until,
