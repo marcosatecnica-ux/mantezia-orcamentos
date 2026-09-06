@@ -71,6 +71,159 @@ app.get('/api/health', async (_req, res) => {
 });
 
 
+
+// MANTEZIA_ORCAMENTOS_GRANDE_BUILD_20260905
+app.get('/api/configuracoes/comercial', async (_req, res) => {
+  if (!pool) {
+    return res.status(503).json({
+      error: 'Banco de dados não configurado.'
+    });
+  }
+
+  const organizationId =
+    process.env.COMPANY_ID?.trim();
+
+  if (!organizationId) {
+    return res.status(503).json({
+      error: 'COMPANY_ID não configurado.'
+    });
+  }
+
+  try {
+    const result = await pool.query(
+      `
+      select
+        id,
+        environment_code,
+        name,
+        default_commercial_clause
+      from orcamentos.organizations
+      where id = $1
+      `,
+      [organizationId]
+    );
+
+    if (!result.rowCount) {
+      return res.status(404).json({
+        error:'Organização não encontrada.'
+      });
+    }
+
+    return res.json({
+      ok:true,
+      configuracao:{
+        organizationId:
+          result.rows[0].id,
+        environment:
+          result.rows[0].environment_code,
+        organizationName:
+          result.rows[0].name,
+        defaultCommercialClause:
+          result.rows[0]
+            .default_commercial_clause || ''
+      }
+    });
+
+  } catch (error) {
+    console.error(
+      '[Mantezia Orçamentos] Erro ao carregar configuração comercial:',
+      error
+    );
+
+    return res.status(503).json({
+      error:
+        'Não foi possível carregar a configuração comercial.'
+    });
+  }
+});
+
+
+app.put('/api/configuracoes/comercial', async (req, res) => {
+  if (!pool) {
+    return res.status(503).json({
+      error:
+        'Banco de dados não configurado.'
+    });
+  }
+
+  const organizationId =
+    process.env.COMPANY_ID?.trim();
+
+  if (!organizationId) {
+    return res.status(503).json({
+      error:
+        'COMPANY_ID não configurado.'
+    });
+  }
+
+  const defaultCommercialClause =
+    String(
+      req.body?.defaultCommercialClause ||
+      ''
+    ).trim();
+
+  if (defaultCommercialClause.length < 3) {
+    return res.status(400).json({
+      error:
+        'Informe a cláusula comercial padrão.'
+    });
+  }
+
+  try {
+    const result = await pool.query(
+      `
+      update orcamentos.organizations
+      set
+        default_commercial_clause = $2,
+        updated_at = now()
+      where id = $1
+      returning
+        id,
+        environment_code,
+        name,
+        default_commercial_clause
+      `,
+      [
+        organizationId,
+        defaultCommercialClause
+      ]
+    );
+
+    if (!result.rowCount) {
+      return res.status(404).json({
+        error:'Organização não encontrada.'
+      });
+    }
+
+    return res.json({
+      ok:true,
+      configuracao:{
+        organizationId:
+          result.rows[0].id,
+        environment:
+          result.rows[0].environment_code,
+        organizationName:
+          result.rows[0].name,
+        defaultCommercialClause:
+          result.rows[0]
+            .default_commercial_clause
+      }
+    });
+
+  } catch (error) {
+    console.error(
+      '[Mantezia Orçamentos] Erro ao salvar configuração comercial:',
+      error
+    );
+
+    return res.status(503).json({
+      error:
+        'Não foi possível salvar a configuração comercial.'
+    });
+  }
+});
+
+
 app.get('/api/orcamentos', async (_req, res) => {
   if (!pool) {
     return res.status(503).json({
@@ -113,6 +266,7 @@ app.get('/api/orcamentos', async (_req, res) => {
         q.execution_days,
         q.payment_terms,
         q.notes,
+        q.commercial_clause,
         q.subtotal,
         q.discount,
         q.total,
@@ -147,11 +301,125 @@ app.get('/api/orcamentos', async (_req, res) => {
       [organizationId]
     );
 
+    let statusPorOs =
+      new Map<string,string | null>();
+
+    const sourceOrderIds =
+      Array.from(
+        new Set(
+          result.rows
+            .map(item =>
+              String(
+                item.source_order_id || ''
+              ).trim()
+            )
+            .filter(Boolean)
+        )
+      );
+
+    if (
+      sourceOrderIds.length > 0 &&
+      operacionalUrl &&
+      orcamentosIntegrationKey
+    ) {
+      try {
+        const responseOperacional =
+          await fetch(
+            `${operacionalUrl}/internal/orcamentos/status-os`,
+            {
+              method:'POST',
+              headers:{
+                'content-type':
+                  'application/json',
+                'x-mantezia-integration-key':
+                  orcamentosIntegrationKey
+              },
+              body:JSON.stringify({
+                sourceOrderIds
+              }),
+              signal:
+                AbortSignal.timeout(
+                  10_000
+                )
+            }
+          );
+
+        if (responseOperacional.ok) {
+          const dadosOperacionais =
+            await responseOperacional
+              .json() as any;
+
+          if (
+            Array.isArray(
+              dadosOperacionais?.ordens
+            )
+          ) {
+            statusPorOs =
+              new Map<
+                string,
+                string | null
+              >(
+                dadosOperacionais
+                  .ordens
+                  .map(
+                    (ordem:any) =>
+                      [
+                        String(
+                          ordem
+                            .sourceOrderId ||
+                          ''
+                        ),
+                        ordem.status == null
+                          ? null
+                          : String(
+                              ordem.status
+                            )
+                      ] as [
+                        string,
+                        string | null
+                      ]
+                  )
+              );
+          }
+
+        } else {
+          console.warn(
+            '[Mantezia Orçamentos] Consulta de status das OS respondeu',
+            responseOperacional.status
+          );
+        }
+
+      } catch (error) {
+        console.warn(
+          '[Mantezia Orçamentos] Status das OS indisponível; listagem seguirá com o banco próprio.',
+          error instanceof Error
+            ? error.message
+            : error
+        );
+      }
+    }
+
+    const orcamentos =
+      result.rows.map(item => ({
+        ...item,
+
+        source_order_status:
+          item.source_order_id
+            ? (
+                statusPorOs.get(
+                  String(
+                    item.source_order_id
+                  )
+                ) ?? null
+              )
+            : null
+      }));
+
     return res.json({
       organizationId,
       environment,
       total: result.rowCount,
-      orcamentos: result.rows
+      orcamentos
     });
   } catch (error) {
     console.error(
@@ -371,6 +639,7 @@ app.post('/api/orcamentos', async (req, res) => {
         execution_days,
         payment_terms,
         notes,
+        commercial_clause,
         subtotal,
         discount,
         total
@@ -379,6 +648,12 @@ app.post('/api/orcamentos', async (req, res) => {
         $1,$2,$3,$4,$5,$6,$7,$8,
         $9,$10,$11,$12,$13,$14,$15,$16,
         'draft',$17,$18,$19,$20,$21,
+        (
+          select
+            default_commercial_clause
+          from orcamentos.organizations
+          where id = $1
+        ),
         $22,$23,$24
       )
       returning *
@@ -541,7 +816,22 @@ app.put('/api/orcamentos/:id', async (req, res) => {
     String(req.body?.paymentTerms || '').trim() || null;
 
   const notes =
-    String(req.body?.notes || '').trim() || null;
+    String(
+      req.body?.notes || ''
+    ).trim() || null;
+
+  const commercialClause =
+    String(
+      req.body?.commercialClause ||
+      ''
+    ).trim();
+
+  if (commercialClause.length < 3) {
+    return res.status(400).json({
+      error:
+        'Informe a cláusula comercial.'
+    });
+  }
 
   const rawItems =
     Array.isArray(req.body?.items)
@@ -645,9 +935,10 @@ app.put('/api/orcamentos/:id', async (req, res) => {
         execution_days = $5,
         payment_terms = $6,
         notes = $7,
-        subtotal = $8,
-        discount = $9,
-        total = $10
+        commercial_clause = $8,
+        subtotal = $9,
+        discount = $10,
+        total = $11
       where id = $1
         and organization_id = $2
       `,
@@ -659,6 +950,7 @@ app.put('/api/orcamentos/:id', async (req, res) => {
         executionDays,
         paymentTerms,
         notes,
+        commercialClause,
         subtotal,
         discount,
         total
@@ -717,6 +1009,7 @@ app.put('/api/orcamentos/:id', async (req, res) => {
         execution_days,
         payment_terms,
         notes,
+        commercial_clause,
         subtotal,
         discount,
         total
@@ -1092,6 +1385,7 @@ app.put('/api/orcamentos/:id/status', async (req, res) => {
     String(req.body?.reason || '').trim() || null;
 
   const permitidos = [
+    'ready_to_send',
     'pending_approval',
     'approved',
     'rejected'
@@ -1150,12 +1444,21 @@ app.put('/api/orcamentos/:id/status', async (req, res) => {
 
     const transicaoValida =
       (
-        novoStatus === 'pending_approval' &&
+        novoStatus ===
+          'ready_to_send' &&
         statusAnterior === 'draft'
       ) ||
       (
-        ['approved','rejected'].includes(novoStatus) &&
-        statusAnterior === 'pending_approval'
+        novoStatus ===
+          'pending_approval' &&
+        statusAnterior ===
+          'ready_to_send'
+      ) ||
+      (
+        ['approved','rejected']
+          .includes(novoStatus) &&
+        statusAnterior ===
+          'pending_approval'
       );
 
     if (!transicaoValida) {
@@ -1165,6 +1468,77 @@ app.put('/api/orcamentos/:id/status', async (req, res) => {
         error:
           'Transição de status não permitida para este orçamento.'
       });
+    }
+
+    if (novoStatus === 'ready_to_send') {
+      const itensParaValidacao =
+        await client.query(
+          `
+          select
+            description,
+            unit_price
+          from orcamentos.quote_items
+          where quote_id = $1
+          order by
+            sort_order,
+            created_at
+          `,
+          [quoteId]
+        );
+
+      const normalizar =
+        (valor: unknown) =>
+          String(valor || '')
+            .normalize('NFD')
+            .replace(
+              /[\u0300-\u036f]/g,
+              ''
+            )
+            .trim()
+            .toLowerCase();
+
+      const maoDeObra =
+        itensParaValidacao.rows.find(
+          item =>
+            normalizar(
+              item.description
+            ) === 'mao de obra'
+        );
+
+      if (!maoDeObra) {
+        await client.query(
+          'rollback'
+        );
+
+        return res
+          .status(409)
+          .json({
+            error:
+              'Inclua o item obrigatório Mão de obra antes de salvar o orçamento.'
+          });
+      }
+
+      if (
+        !Number.isFinite(
+          Number(
+            maoDeObra.unit_price
+          )
+        ) ||
+        Number(
+          maoDeObra.unit_price
+        ) <= 0
+      ) {
+        await client.query(
+          'rollback'
+        );
+
+        return res
+          .status(409)
+          .json({
+            error:
+              'Informe o valor da Mão de obra antes de salvar o orçamento.'
+          });
+      }
     }
 
     if (novoStatus === 'approved') {
@@ -1313,6 +1687,7 @@ app.put('/api/orcamentos/:id/status', async (req, res) => {
         q.execution_days,
         q.payment_terms,
         q.notes,
+        q.commercial_clause,
         q.subtotal,
         q.discount,
         q.total,
