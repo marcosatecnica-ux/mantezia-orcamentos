@@ -63,6 +63,27 @@ type RascunhoOrcamento = {
   itens: ItemRascunho[];
 };
 
+type NovoOrcamentoManual = {
+  cliente: string;
+  telefone: string;
+  email: string;
+  endereco: string;
+  equipamento: string;
+  detalhesEquipamento: string;
+  tecnico: string;
+};
+
+const novoOrcamentoManualVazio =
+  (): NovoOrcamentoManual => ({
+    cliente:'',
+    telefone:'',
+    email:'',
+    endereco:'',
+    equipamento:'',
+    detalhesEquipamento:'',
+    tecnico:''
+  });
+
 type OrcamentoApi = {
   id: string;
   code: string;
@@ -326,7 +347,11 @@ const mapearOrcamento = (
   descricao:
     item.technical_diagnosis ||
     item.technical_recommendation ||
-    'Diagnóstico técnico ainda não informado.',
+    (
+      item.source_order_id
+        ? 'Diagnóstico técnico ainda não informado.'
+        : ''
+    ),
 
   causa:
     item.technical_cause || '',
@@ -576,6 +601,35 @@ export default function OrcamentoApp() {
     mostrarHistorico,
     setMostrarHistorico
   ] = useState(false);
+
+  const [
+    mostrarTodos,
+    setMostrarTodos
+  ] = useState(false);
+
+  const [
+    telaAtiva,
+    setTelaAtiva
+  ] = useState<'visao-geral' | 'orcamentos'>(
+    'visao-geral'
+  );
+
+  const [
+    novoManualAberto,
+    setNovoManualAberto
+  ] = useState(false);
+
+  const [
+    criandoManual,
+    setCriandoManual
+  ] = useState(false);
+
+  const [
+    novoManual,
+    setNovoManual
+  ] = useState<NovoOrcamentoManual>(
+    novoOrcamentoManualVazio()
+  );
 
   const [
     configAberta,
@@ -1153,6 +1207,213 @@ export default function OrcamentoApp() {
         );
       }
     };
+
+  const abrirNovoOrcamentoManual =
+    () => {
+      setNovoManual(
+        novoOrcamentoManualVazio()
+      );
+
+      setNovoManualAberto(true);
+      setSelecionado(null);
+      setRascunho(null);
+      setEditando(false);
+      setConfigAberta(false);
+
+      setTelaAtiva(
+        'orcamentos'
+      );
+
+      setMostrarTodos(true);
+      setMostrarHistorico(false);
+    };
+
+
+  const criarNovoOrcamentoManual =
+    async () => {
+      if (criandoManual) {
+        return;
+      }
+
+      const cliente =
+        novoManual.cliente.trim();
+
+      const equipamento =
+        novoManual.equipamento.trim();
+
+      if (cliente.length < 2) {
+        demonstrar(
+          'Informe o cliente.'
+        );
+
+        return;
+      }
+
+      if (equipamento.length < 2) {
+        demonstrar(
+          'Informe o equipamento.'
+        );
+
+        return;
+      }
+
+      setCriandoManual(true);
+
+      try {
+        const response =
+          await fetch(
+            '/api/orcamentos',
+            {
+              method:'POST',
+
+              headers:{
+                'Content-Type':
+                  'application/json'
+              },
+
+              body:
+                JSON.stringify({
+                  clientName:
+                    cliente,
+
+                  clientPhone:
+                    novoManual.telefone
+                      .trim() ||
+                    null,
+
+                  clientEmail:
+                    novoManual.email
+                      .trim() ||
+                    null,
+
+                  address:
+                    novoManual.endereco
+                      .trim() ||
+                    null,
+
+                  equipment:
+                    equipamento,
+
+                  equipmentDetails:
+                    novoManual
+                      .detalhesEquipamento
+                      .trim() ||
+                    null,
+
+                  technicianName:
+                    novoManual.tecnico
+                      .trim() ||
+                    null,
+
+                  technicalDiagnosis:
+                    null,
+
+                  technicalCause:
+                    null,
+
+                  technicalRecommendation:
+                    null,
+
+                  validUntil:
+                    null,
+
+                  warrantyDays:
+                    90,
+
+                  executionDays:
+                    null,
+
+                  paymentTerms:
+                    null,
+
+                  notes:
+                    null,
+
+                  sourceOrderId:
+                    null,
+
+                  sourceOrderCode:
+                    null,
+
+                  discount:
+                    0,
+
+                  items:[]
+                })
+            }
+          );
+
+        const data =
+          await response.json();
+
+        if (!response.ok) {
+          throw new Error(
+            data?.error ||
+            `API respondeu ${response.status}`
+          );
+        }
+
+        const atualizados =
+          await carregarOrcamentos();
+
+        const criado =
+          atualizados.find(
+            item =>
+              item.databaseId ===
+              data?.orcamento?.id
+          ) ||
+          (
+            data?.orcamento
+              ? mapearOrcamento(
+                  data.orcamento
+                )
+              : null
+          );
+
+        if (!criado) {
+          throw new Error(
+            'O orçamento foi criado, mas não foi possível abri-lo.'
+          );
+        }
+
+        setNovoManualAberto(
+          false
+        );
+
+        setNovoManual(
+          novoOrcamentoManualVazio()
+        );
+
+        setSelecionado(
+          criado
+        );
+
+        setEditando(true);
+
+        setMostrarTodos(false);
+        setMostrarHistorico(false);
+
+        demonstrar(
+          `Orçamento ${criado.id} criado em branco.`
+        );
+
+      } catch (error) {
+        console.error(
+          '[Mantezia Orçamentos] Falha ao criar orçamento manual:',
+          error
+        );
+
+        demonstrar(
+          error instanceof Error
+            ? error.message
+            : 'Não foi possível criar o orçamento manual.'
+        );
+
+      } finally {
+        setCriandoManual(false);
+      }
+    };
+
 
   const salvarOrcamentoCompleto =
     async () => {
@@ -3308,58 +3569,39 @@ export default function OrcamentoApp() {
       </header>
 
       <div className="layout">
-        <aside className="sidebar">
+                <aside className="sidebar">
           <div className="side-label">
             Comercial
           </div>
 
-          <div className="navitem active">
+          <div
+            className={`navitem ${
+              telaAtiva === 'visao-geral'
+                ? 'active'
+                : ''
+            }`}
+            onClick={() => {
+              setTelaAtiva('visao-geral');
+              setMostrarTodos(false);
+              setMostrarHistorico(false);
+            }}
+          >
             ▣ Visão Geral
           </div>
 
-          <div className="navitem">
+          <div
+            className={`navitem ${
+              telaAtiva === 'orcamentos'
+                ? 'active'
+                : ''
+            }`}
+            onClick={() => {
+              setTelaAtiva('orcamentos');
+              setMostrarTodos(true);
+              setMostrarHistorico(false);
+            }}
+          >
             ▤ Orçamentos
-          </div>
-
-          <div className="navitem">
-            ✓ Aprovações
-          </div>
-
-          <div className="navitem">
-            ◎ Clientes
-          </div>
-
-          <div
-            className="side-label"
-            style={{
-              marginTop:28
-            }}
-          >
-            Integração
-          </div>
-
-          <div className="navitem">
-            ↔ Ordens de Serviço
-          </div>
-
-          <div className="navitem">
-            ◈ Indicadores
-          </div>
-
-          <div
-            className="navitem"
-
-            style={{
-              cursor:'pointer'
-            }}
-
-            onClick={() =>
-              setConfigAberta(
-                valor => !valor
-              )
-            }
-          >
-            ⚙ Configurações
           </div>
         </aside>
 
@@ -3367,11 +3609,15 @@ export default function OrcamentoApp() {
           <div className="heading">
             <div>
               <h1>
-                Portal de Orçamentos
+                {telaAtiva === 'visao-geral'
+                  ? 'Portal de Orçamentos'
+                  : 'Todos os Orçamentos'}
               </h1>
 
               <div className="subtitle">
-                Propostas comerciais conectadas à operação técnica Mantezia.
+                {telaAtiva === 'visao-geral'
+                  ? 'Propostas comerciais conectadas à operação técnica Mantezia.'
+                  : 'Consulte todos os orçamentos, pendências e históricos.'}
               </div>
             </div>
 
@@ -3390,17 +3636,242 @@ export default function OrcamentoApp() {
 
               <button
                 className="primary"
-
-                onClick={() =>
-                  demonstrar(
-                    'Novo orçamento — fluxo em conclusão'
-                  )
+                onClick={
+                  abrirNovoOrcamentoManual
                 }
               >
                 + Novo orçamento
               </button>
             </div>
           </div>
+
+          {novoManualAberto && (
+            <section className="config-card">
+              <div className="config-card-head">
+                <div>
+                  <div className="config-title">
+                    Novo orçamento manual
+                  </div>
+
+                  <div className="config-help">
+                    Este orçamento não será vinculado a uma Ordem de Serviço.
+                    Os campos começam em branco para preenchimento manual.
+                  </div>
+                </div>
+
+                <button
+                  className="secondary"
+                  disabled={criandoManual}
+                  onClick={() =>
+                    setNovoManualAberto(
+                      false
+                    )
+                  }
+                >
+                  Fechar
+                </button>
+              </div>
+
+              <div className="info-grid">
+                <label>
+                  <span className="label">
+                    CLIENTE *
+                  </span>
+
+                  <input
+                    className="edit-input"
+                    value={
+                      novoManual.cliente
+                    }
+                    onChange={e =>
+                      setNovoManual(
+                        atual => ({
+                          ...atual,
+                          cliente:
+                            e.target.value
+                        })
+                      )
+                    }
+                  />
+                </label>
+
+                <label>
+                  <span className="label">
+                    EQUIPAMENTO *
+                  </span>
+
+                  <input
+                    className="edit-input"
+                    value={
+                      novoManual.equipamento
+                    }
+                    onChange={e =>
+                      setNovoManual(
+                        atual => ({
+                          ...atual,
+                          equipamento:
+                            e.target.value
+                        })
+                      )
+                    }
+                  />
+                </label>
+
+                <label>
+                  <span className="label">
+                    TELEFONE
+                  </span>
+
+                  <input
+                    className="edit-input"
+                    value={
+                      novoManual.telefone
+                    }
+                    onChange={e =>
+                      setNovoManual(
+                        atual => ({
+                          ...atual,
+                          telefone:
+                            e.target.value
+                        })
+                      )
+                    }
+                  />
+                </label>
+
+                <label>
+                  <span className="label">
+                    E-MAIL
+                  </span>
+
+                  <input
+                    className="edit-input"
+                    type="email"
+                    value={
+                      novoManual.email
+                    }
+                    onChange={e =>
+                      setNovoManual(
+                        atual => ({
+                          ...atual,
+                          email:
+                            e.target.value
+                        })
+                      )
+                    }
+                  />
+                </label>
+
+                <label
+                  style={{
+                    gridColumn:
+                      '1 / -1'
+                  }}
+                >
+                  <span className="label">
+                    ENDEREÇO
+                  </span>
+
+                  <input
+                    className="edit-input"
+                    value={
+                      novoManual.endereco
+                    }
+                    onChange={e =>
+                      setNovoManual(
+                        atual => ({
+                          ...atual,
+                          endereco:
+                            e.target.value
+                        })
+                      )
+                    }
+                  />
+                </label>
+
+                <label
+                  style={{
+                    gridColumn:
+                      '1 / -1'
+                  }}
+                >
+                  <span className="label">
+                    DETALHES DO EQUIPAMENTO
+                  </span>
+
+                  <input
+                    className="edit-input"
+                    value={
+                      novoManual
+                        .detalhesEquipamento
+                    }
+                    onChange={e =>
+                      setNovoManual(
+                        atual => ({
+                          ...atual,
+                          detalhesEquipamento:
+                            e.target.value
+                        })
+                      )
+                    }
+                  />
+                </label>
+
+                <label
+                  style={{
+                    gridColumn:
+                      '1 / -1'
+                  }}
+                >
+                  <span className="label">
+                    TÉCNICO RESPONSÁVEL
+                  </span>
+
+                  <input
+                    className="edit-input"
+                    value={
+                      novoManual.tecnico
+                    }
+                    onChange={e =>
+                      setNovoManual(
+                        atual => ({
+                          ...atual,
+                          tecnico:
+                            e.target.value
+                        })
+                      )
+                    }
+                  />
+                </label>
+              </div>
+
+              <div className="config-actions">
+                <button
+                  className="secondary approve"
+                  disabled={criandoManual}
+                  onClick={() =>
+                    void criarNovoOrcamentoManual()
+                  }
+                >
+                  {criandoManual
+                    ? 'Criando...'
+                    : 'Criar orçamento'}
+                </button>
+
+                <button
+                  className="secondary"
+                  disabled={criandoManual}
+                  onClick={() =>
+                    setNovoManualAberto(
+                      false
+                    )
+                  }
+                >
+                  Cancelar
+                </button>
+              </div>
+            </section>
+          )}
 
           {configAberta && (
             <section className="config-card">
@@ -3466,6 +3937,7 @@ export default function OrcamentoApp() {
             </section>
           )}
 
+          {telaAtiva === 'visao-geral' && (
           <section className="cards">
             <div className="card">
               <div className="card-label">
@@ -3539,6 +4011,7 @@ export default function OrcamentoApp() {
               </div>
             </div>
           </section>
+          )}
 
           <div className="content-grid">
             <section className="panel">
@@ -3568,24 +4041,39 @@ export default function OrcamentoApp() {
                     }}
                   >
                     <div className="panel-title">
-                      {mostrarHistorico
-                        ? 'Histórico'
-                        : 'Pendências'}
+                      {mostrarTodos
+                        ? 'Todos os Orçamentos'
+                        : mostrarHistorico
+                          ? 'Histórico'
+                          : 'Pendências'}
                     </div>
 
                     <div className="queue-tabs">
                       <button
                         className={`queue-tab ${
+                          mostrarTodos
+                            ? 'active'
+                            : ''
+                        }`}
+                        onClick={() => {
+                          setMostrarTodos(true);
+                          setMostrarHistorico(false);
+                        }}
+                      >
+                        Todos
+                      </button>
+
+                      <button
+                        className={`queue-tab ${
+                          !mostrarTodos &&
                           !mostrarHistorico
                             ? 'active'
                             : ''
                         }`}
-
-                        onClick={() =>
-                          setMostrarHistorico(
-                            false
-                          )
-                        }
+                        onClick={() => {
+                          setMostrarTodos(false);
+                          setMostrarHistorico(false);
+                        }}
                       >
                         Pendências
                       </button>
@@ -3596,12 +4084,10 @@ export default function OrcamentoApp() {
                             ? 'active'
                             : ''
                         }`}
-
-                        onClick={() =>
-                          setMostrarHistorico(
-                            true
-                          )
-                        }
+                        onClick={() => {
+                          setMostrarTodos(false);
+                          setMostrarHistorico(true);
+                        }}
                       >
                         Histórico
                       </button>
@@ -3627,6 +4113,18 @@ export default function OrcamentoApp() {
                   <div className="queue-empty">
                     Carregando...
                   </div>
+
+                ) : mostrarTodos ? (
+                  filtrados.length > 0
+                    ? filtrados.map(
+                        renderLinha
+                      )
+
+                    : (
+                      <div className="queue-empty">
+                        Nenhum orçamento encontrado.
+                      </div>
+                    )
 
                 ) : mostrarHistorico ? (
                   historico.length > 0
