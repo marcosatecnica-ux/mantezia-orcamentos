@@ -1,7 +1,9 @@
 import 'dotenv/config';
+import { registerOficinaGuard } from './src/server/oficina-guard';
 import express from 'express';
 import path from 'path';
 import pg from 'pg';
+import { timingSafeEqual } from 'crypto';
 
 const { Pool } = pg;
 
@@ -16,6 +18,13 @@ const operacionalUrl =
 
 const orcamentosIntegrationKey =
   process.env.ORCAMENTOS_INTEGRATION_KEY?.trim();
+
+const oficinaKeyValida = (req: import('express').Request) => {
+  const expected = orcamentosIntegrationKey || '';
+  const given = String(req.headers['x-mantezia-integration-key'] || '');
+  const a = Buffer.from(expected); const b = Buffer.from(given);
+  return Boolean(expected && given && a.length === b.length && timingSafeEqual(a, b));
+};
 
 const openaiApiKey =
   process.env.OPENAI_API_KEY?.trim();
@@ -32,6 +41,8 @@ const pool = databaseUrl
           : undefined
     })
   : null;
+
+registerOficinaGuard(app, { pool, keyValid: oficinaKeyValida });
 
 app.get('/api/health', async (_req, res) => {
   if (!pool) {
@@ -296,9 +307,10 @@ app.get('/api/orcamentos', async (_req, res) => {
         ) as items
       from orcamentos.quotes q
       where q.organization_id = $1
+        AND (q.source_order_code IS NULL OR q.source_order_code NOT LIKE 'OF-%' OR $2::boolean)
       order by q.created_at desc
       `,
-      [organizationId]
+      [organizationId, oficinaKeyValida(_req) && Boolean(_req.headers['x-mantezia-environment'])]
     );
 
     let statusPorOs =
@@ -451,6 +463,9 @@ app.post('/api/orcamentos', async (req, res) => {
   const clientId =
     String(req.body?.clientId || '').trim() || null;
 
+  if (String(req.body?.sourceOrderCode || '').startsWith('OF-') && !oficinaKeyValida(req)) {
+    return res.status(401).json({ error: 'Criacao de Oficina exige servidor autorizado.' });
+  }
   const clientName = String(req.body?.clientName || '').trim();
   const clientPhone = String(req.body?.clientPhone || '').trim() || null;
   const clientEmail = String(req.body?.clientEmail || '').trim() || null;
@@ -900,7 +915,7 @@ app.put('/api/orcamentos/:id', async (req, res) => {
 
     const existente = await client.query(
       `
-      select id, status
+      select id, status, source_order_code
       from orcamentos.quotes
       where id = $1
         and organization_id = $2
@@ -917,6 +932,10 @@ app.put('/api/orcamentos/:id', async (req, res) => {
       });
     }
 
+    if (String(existente.rows[0].source_order_code || '').startsWith('OF-') && !oficinaKeyValida(req)) {
+      await client.query('rollback');
+      return res.status(401).json({ error: 'Edicao da Oficina exige servidor autorizado.' });
+    }
     if (existente.rows[0].status !== 'draft') {
       await client.query('rollback');
 
@@ -1109,6 +1128,7 @@ app.put('/api/orcamentos/:id/tecnico', async (req, res) => {
       where id = $1
         and organization_id = $2
         and status = 'draft'
+        and (source_order_code IS NULL OR source_order_code NOT LIKE 'OF-%' OR $6::boolean)
       returning
         id,
         technical_diagnosis,
@@ -1120,7 +1140,8 @@ app.put('/api/orcamentos/:id/tecnico', async (req, res) => {
         organizationId,
         technicalDiagnosis,
         technicalCause,
-        technicalRecommendation
+        technicalRecommendation,
+        oficinaKeyValida(req)
       ]
     );
 
@@ -1439,6 +1460,12 @@ app.put('/api/orcamentos/:id/status', async (req, res) => {
       });
     }
 
+    if (String(atual.rows[0].source_order_code || '').startsWith('OF-')) {
+      if (!oficinaKeyValida(req) || ['approved','rejected'].includes(novoStatus)) {
+        await client.query('rollback');
+        return res.status(403).json({ error: 'Decisao da Oficina somente pelo Portal do Cliente.' });
+      }
+    }
     const statusAnterior =
       atual.rows[0].status;
 
@@ -1739,6 +1766,199 @@ app.put('/api/orcamentos/:id/status', async (req, res) => {
     client.release();
   }
 });
+
+// OFICINA_BRIDGE_READ_ONLY_032 — Consulta interna autenticada, SOMENTE LEITURA.
+// Nao recebe decisao de cliente, nao altera status, nao libera reparos.
+app.post('/internal/oficina/consultar-orcamentos', async (req, res) => {
+  // Falha fechada. Esta chave fica exclusivamente no servidor, NUNCA no APK.
+  const configured = orcamentosIntegrationKey || '';
+  const supplied = String(req.headers['x-mantezia-integration-key'] || '');
+  const a = Buffer.from(configured, 'utf8');
+  const b = Buffer.from(supplied, 'utf8');
+  if (!configured || !supplied || a.length !== b.length || !timingSafeEqual(a, b)) {
+    return res.status(401).json({ error: 'Integracao nao autorizada.' });
+  }
+  const organizationId = process.env.COMPANY_ID?.trim();
+  if (!pool || !organizationId) {
+    return res.status(503).json({ error: 'Orcamentos indisponivel.' });
+  }
+  const raw = req.body?.sourceOrderIds;
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > 30 ||
+      raw.some((value: unknown) => typeof value !== 'string' || value.length < 8 || value.length > 128)) {
+    return res.status(400).json({ error: 'Lista de OS invalida.' });
+  }
+  const sourceOrderIds = [...new Set(raw.map((value: string) => value.trim()))];
+  if (sourceOrderIds.length !== raw.length || sourceOrderIds.some((value: string) => !value)) {
+    return res.status(400).json({ error: 'IDs de OS repetidos ou invalidos.' });
+  }
+  try {
+    const result = await pool.query(
+      `SELECT q.id AS "quoteId", q.code AS "quoteCode",
+              q.source_order_id AS "sourceOrderId", q.source_order_code AS "sourceOrderCode",
+              q.client_id AS "clientId", q.status,
+              q.approved_at AS "approvedAt", q.rejected_at AS "rejectedAt",
+              EXISTS (SELECT 1 FROM orcamentos.quote_status_history h
+                WHERE h.quote_id = q.id AND h.new_status = 'approved'
+                AND h.changed_by = ('portal_cliente:' || q.client_id::text)) AS "portalConfirmed"
+         FROM orcamentos.quotes q
+        WHERE q.organization_id = $1
+          AND q.source_order_id::text = ANY($2::text[])
+        ORDER BY q.created_at DESC`,
+      [organizationId, sourceOrderIds]
+    );
+    return res.json({ ok: true, orcamentos: result.rows });
+  } catch (error) {
+    console.error('[Oficina] Consulta interna de orcamentos falhou:', error instanceof Error ? error.message : error);
+    return res.status(503).json({ error: 'Consulta interna indisponivel.' });
+  }
+});
+
+
+// OFICINA_PORTAL_DECISAO_033 — isolado das OS de campo.
+// NUNCA usar credenciais do cliente no Orcamentos. O Operacional valida a sessao
+// e apresenta somente o clientId derivado no servidor.
+const oficinaInternalReady = (req: import('express').Request, res: import('express').Response) => {
+  if (!oficinaKeyValida(req)) { res.status(401).json({ error: 'Integracao nao autorizada.' }); return false; }
+  if (!pool || !process.env.COMPANY_ID?.trim()) {
+    res.status(503).json({ error: 'Modulo indisponivel.' }); return false;
+  }
+  return true;
+};
+const oficinaIdsValidos = (raw: unknown): raw is string[] =>
+  Array.isArray(raw) && raw.length > 0 && raw.length <= 30 &&
+  raw.every(x => typeof x === 'string' && /^[A-Za-z0-9_-]{20,64}$/.test(x)) && new Set(raw).size === raw.length;
+
+app.post('/internal/oficina/cliente-orcamentos', async (req, res) => {
+  if (!oficinaInternalReady(req,res)) return;
+  const clientId = String(req.body?.clientId || '').trim();
+  const ids = req.body?.sourceOrderIds;
+  if (!clientId || !oficinaIdsValidos(ids)) return res.status(400).json({ error: 'Consulta invalida.' });
+  try {
+    const r = await pool!.query(`
+      SELECT q.id AS "quoteId", q.code AS "quoteCode", q.source_order_id AS "sourceOrderId",
+             q.source_order_code AS "sourceOrderCode", q.status, q.total, q.subtotal,
+             q.discount, q.payment_terms AS "paymentTerms", q.valid_until AS "validUntil",
+             q.warranty_days AS "warrantyDays", q.execution_days AS "executionDays",
+             q.equipment, q.technical_diagnosis AS "technicalDiagnosis",
+             q.approved_at AS "approvedAt", q.rejected_at AS "rejectedAt",
+             COALESCE((SELECT json_agg(json_build_object('description',i.description,
+               'quantity',i.quantity,'unitPrice',i.unit_price,'total',i.total) ORDER BY i.sort_order)
+               FROM orcamentos.quote_items i WHERE i.quote_id=q.id), '[]'::json) AS items
+        FROM orcamentos.quotes q
+       WHERE q.organization_id=$1 AND q.client_id::text=$2
+         AND q.source_order_id::text=ANY($3::text[])
+         AND q.source_order_code LIKE 'OF-%'
+         AND q.status IN ('pending_approval','approved','rejected')
+       ORDER BY q.created_at DESC`, [process.env.COMPANY_ID,clientId,ids]);
+    return res.json({ orcamentos:r.rows });
+  } catch { return res.status(503).json({ error: 'Consulta indisponivel.' }); }
+});
+
+app.post('/internal/oficina/cliente-decidir', async (req, res) => {
+  if (!oficinaInternalReady(req,res)) return;
+  const quoteId = String(req.body?.quoteId || '').trim();
+  const sourceOrderId = String(req.body?.sourceOrderId || '').trim();
+  const sourceOrderCode = String(req.body?.sourceOrderCode || '').trim();
+  const clientId = String(req.body?.clientId || '').trim();
+  const status = String(req.body?.status || '').trim();
+  if (!quoteId || !/^[A-Za-z0-9_-]{20,64}$/.test(sourceOrderId) ||
+      !/^OF-\d+$/.test(sourceOrderCode) || !clientId || !['approved','rejected'].includes(status)) {
+    return res.status(400).json({ error: 'Decisao invalida.' });
+  }
+  const db = await pool!.connect();
+  try {
+    await db.query('BEGIN');
+    const r = await db.query(`
+      SELECT id, code, status, approved_at, rejected_at, total, valid_until, client_id
+        FROM orcamentos.quotes
+       WHERE id=$1 AND organization_id=$2 AND client_id::text=$3
+         AND source_order_id::text=$4 AND source_order_code=$5
+       FOR UPDATE`, [quoteId,process.env.COMPANY_ID,clientId,sourceOrderId,sourceOrderCode]);
+    if (!r.rowCount) { await db.query('ROLLBACK'); return res.status(404).json({ error: 'Orcamento nao pertence ao cliente ou OS.' }); }
+    const quote = r.rows[0];
+    if (quote.status === status) {
+      const h = await db.query(`SELECT 1 FROM orcamentos.quote_status_history
+        WHERE quote_id=$1 AND new_status=$2 AND changed_by=$3 LIMIT 1`,
+        [quoteId,status,'portal_cliente:'+clientId]);
+      await db.query('COMMIT');
+      return h.rowCount ? res.json({ ok:true, idempotente:true, quoteId,
+        decidedAt:status==='approved'?quote.approved_at:quote.rejected_at })
+        : res.status(409).json({ error: 'Decisao preexistente sem origem autenticada.' });
+    }
+    if (quote.status !== 'pending_approval') {
+      await db.query('ROLLBACK'); return res.status(409).json({ error: 'Proposta nao aguarda decisao.' });
+    }
+    if (status === 'approved') {
+      if (!Number.isFinite(Number(quote.total)) || Number(quote.total) <= 0 ||
+          (quote.valid_until && Date.parse(quote.valid_until) < Date.now())) {
+        await db.query('ROLLBACK'); return res.status(409).json({ error: 'Valor ou validade do orcamento invalido.' });
+      }
+      const items = await db.query(`SELECT COUNT(*)::int AS quantidade FROM orcamentos.quote_items
+        WHERE quote_id=$1 AND unit_price>0 AND quantity>0`,[quoteId]);
+      if (Number(items.rows[0]?.quantidade || 0) < 1) {
+        await db.query('ROLLBACK'); return res.status(409).json({ error: 'Orcamento sem itens precificados.' });
+      }
+    }
+    const upd = await db.query(`UPDATE orcamentos.quotes
+      SET status=$2, approved_at=CASE WHEN $2='approved' THEN now() ELSE approved_at END,
+          rejected_at=CASE WHEN $2='rejected' THEN now() ELSE rejected_at END
+      WHERE id=$1 RETURNING approved_at,rejected_at`,[quoteId,status]);
+    await db.query(`INSERT INTO orcamentos.quote_status_history
+      (quote_id,previous_status,new_status,changed_by,reason)
+      VALUES($1,'pending_approval',$2,$3,$4)`,
+      [quoteId,status,'portal_cliente:'+clientId,'Decisao no Portal do Cliente autenticado']);
+    await db.query('COMMIT');
+    return res.json({ ok:true, quoteId, status, decidedAt:status==='approved'
+      ?upd.rows[0].approved_at:upd.rows[0].rejected_at });
+  } catch (error) {
+    try { await db.query('ROLLBACK'); } catch {}
+    console.error('[Oficina] Falha ao registrar decisao:',error instanceof Error?error.message:error);
+    return res.status(503).json({ error: 'Decisao nao confirmada.' });
+  } finally { db.release(); }
+});
+
+app.post('/internal/oficina/fila-aprovados', async (req, res) => {
+  if (!oficinaInternalReady(req,res)) return;
+  const ids = req.body?.sourceOrderIds;
+  if (!oficinaIdsValidos(ids)) return res.status(400).json({ error: 'OS invalidas.' });
+  try {
+    const r = await pool!.query(`SELECT q.id AS "quoteId", q.code AS "quoteCode",
+      q.source_order_id AS "sourceOrderId", q.source_order_code AS "sourceOrderCode",
+      q.client_id AS "clientId", q.approved_at AS "approvedAt"
+      FROM orcamentos.quotes q WHERE q.organization_id=$1
+      AND q.source_order_id::text = ANY($2::text[]) AND q.source_order_code LIKE 'OF-%'
+      AND q.client_id IS NOT NULL AND q.status='approved' AND q.approved_at IS NOT NULL
+      AND EXISTS (SELECT 1 FROM orcamentos.quote_status_history h
+          WHERE h.quote_id=q.id AND h.new_status='approved'
+          AND h.changed_by=('portal_cliente:' || q.client_id::text))
+      ORDER BY q.approved_at ASC, q.id ASC`,[process.env.COMPANY_ID,ids]);
+    return res.json({ fila:r.rows });
+  } catch { return res.status(503).json({ error: 'Fila indisponivel.' }); }
+});
+
+// Gestao financeira via Portal Operacional autenticado, nunca via AppOficina.
+app.post('/internal/oficina/gestao-orcamentos', async (req, res) => {
+  if (!oficinaInternalReady(req,res)) return;
+  const ids = req.body?.sourceOrderIds;
+  if (!oficinaIdsValidos(ids)) return res.status(400).json({ error: 'OS invalidas.' });
+  try {
+    const r = await pool!.query(`SELECT q.id AS "quoteId", q.code AS "quoteCode",
+      q.source_order_id AS "sourceOrderId", q.source_order_code AS "sourceOrderCode",
+      q.client_id AS "clientId", q.client_name AS "clientName", q.status,
+      q.total, q.subtotal, q.discount, q.payment_terms AS "paymentTerms",
+      q.valid_until AS "validUntil", q.notes, q.commercial_clause AS "commercialClause",
+      q.warranty_days AS "warrantyDays", q.execution_days AS "executionDays",
+      q.equipment, q.technical_diagnosis AS "technicalDiagnosis",
+      COALESCE((SELECT json_agg(json_build_object('description',i.description,
+      'quantity',i.quantity,'unitPrice',i.unit_price,'total',i.total) ORDER BY i.sort_order)
+      FROM orcamentos.quote_items i WHERE i.quote_id=q.id),'[]'::json) AS items
+      FROM orcamentos.quotes q WHERE q.organization_id=$1
+      AND q.source_order_id::text=ANY($2::text[]) AND q.source_order_code LIKE 'OF-%'
+      ORDER BY q.created_at DESC`,[process.env.COMPANY_ID,ids]);
+    return res.json({ orcamentos:r.rows });
+  } catch { return res.status(503).json({ error: 'Consulta indisponivel.' }); }
+});
+
 const distDir = path.join(process.cwd(), 'dist');
 
 app.use(express.static(distDir));
